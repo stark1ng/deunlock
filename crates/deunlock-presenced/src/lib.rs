@@ -10,6 +10,7 @@
 //! Journey: `specs/journeys/JOURNEY-S-001-scaffold-deunlock-presenced.md`.
 
 pub mod audit;
+pub mod composite;
 pub mod lock;
 pub mod orchestrator;
 pub mod rpc;

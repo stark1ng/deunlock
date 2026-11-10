@@ -79,6 +79,11 @@ deunlock-core = { version = "0.3", path = "../deunlock-core" }
 # double for the rotation integration test; it is a default feature
 # of `deunlock-transport` so no explicit `features` list is required.
 deunlock-transport = { version = "0.3", path = "../deunlock-transport" }
+# The LAN backend. Optional at runtime: the daemon only binds the listener when
+# DEUNLOCK_LAN is set, and a failure there leaves the BLE path untouched.
+deunlock-net = { version = "0.3", path = "../deunlock-net" }
+async-trait = "0.1.92"
+futures = "0.3"
 # S-004: 128-bit UUID type for the rotation audit short-hex render.
 uuid = { version = "1" }
 # S-005: belt-and-suspenders inotify watcher on `bonds.toml`. The

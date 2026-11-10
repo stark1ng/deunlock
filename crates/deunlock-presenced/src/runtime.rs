@@ -16,6 +16,8 @@ use std::{
 
 use deunlock_core::{Bond, BondStatus, BondStore, bond_key_from_pubkeys, peer_id_from_pubkey};
 use deunlock_transport::{BOND_KEY_BYTES, FakePeripheral, Peripheral, PersistentPeripheral};
+
+use crate::composite::CompositePeripheral;
 use tokio::{
     signal::unix::{SignalKind, signal},
     sync::mpsc,
@@ -216,10 +218,6 @@ pub async fn run(config: Config) -> Result<ShutdownReason, RunError> {
         "single-instance pidfile lock acquired"
     );
 
-    let (orch_shutdown_tx, orch_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let (orch_task, reload_tx, orch_handle) = maybe_spawn_orchestrator(&config, orch_shutdown_rx).await?;
-
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     // The desktop's identity, provisioned by `deunlock pair --host-key`. When it
     // is missing the daemon still runs, but challenges stay v1 — a half-installed
     // system authenticates instead of bricking. `DEUNLOCK_HOST_KEY` lets tests
@@ -233,6 +231,11 @@ pub async fn run(config: Config) -> Result<ShutdownReason, RunError> {
             None
         }
     };
+
+    let (orch_shutdown_tx, orch_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (orch_task, reload_tx, orch_handle) = maybe_spawn_orchestrator(&config, host_id, orch_shutdown_rx).await?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let serve_config = ServeConfig {
         socket_path: config.socket.clone(),
         expected_uid: config.expected_uid,
@@ -325,6 +328,106 @@ async fn wait_for_reason(
     }
 }
 
+/// Start the LAN listener when `DEUNLOCK_LAN` is set, returning its peripheral.
+///
+/// `DEUNLOCK_NET_CERT` / `DEUNLOCK_NET_KEY` override the identity paths (default
+/// `/etc/deunlock/net.crt` and `/etc/deunlock/net.key`); `DEUNLOCK_LAN_PORT`
+/// overrides the port (default 47823).
+///
+/// Returns `None` — with a warning — when the listener cannot be brought up. The
+/// daemon then runs exactly as before, on BLE alone.
+async fn start_lan(config: &Config, host_id: Option<[u8; 32]>) -> Option<Arc<dyn Peripheral + Send + Sync>> {
+    if !env_flag("DEUNLOCK_LAN") {
+        return None;
+    }
+    let Some(host_id) = host_id else {
+        tracing::warn!("DEUNLOCK_LAN is set but there is no host identity; LAN transport stays off");
+        return None;
+    };
+
+    let cert = std::env::var_os("DEUNLOCK_NET_CERT")
+        .map_or_else(|| std::path::PathBuf::from(deunlock_net::lan::DEFAULT_NET_CERT_PATH), std::path::PathBuf::from);
+    let key = std::env::var_os("DEUNLOCK_NET_KEY")
+        .map_or_else(|| std::path::PathBuf::from(deunlock_net::lan::DEFAULT_NET_KEY_PATH), std::path::PathBuf::from);
+    let identity = match deunlock_net::LanIdentity::load_or_create(&cert, &key) {
+        Ok(identity) => identity,
+        Err(err) => {
+            tracing::warn!(cert = %cert.display(), error = %err, "LAN identity unavailable; LAN transport stays off");
+            return None;
+        }
+    };
+
+    let port: u16 = std::env::var("DEUNLOCK_LAN_PORT")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(deunlock_net::lan::DEFAULT_LAN_PORT);
+
+    let keys_dir = config.keys_dir.clone();
+    let bonds: Arc<dyn deunlock_net::BondLookup> = Arc::new(move |peer_hex: &str| load_bond_key(&keys_dir, peer_hex).ok());
+
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let server = match deunlock_net::LanServer::bind(addr, &identity, host_id, bonds).await {
+        Ok(server) => server,
+        Err(err) => {
+            tracing::warn!(%addr, error = %err, "LAN listener bind failed; LAN transport stays off");
+            return None;
+        }
+    };
+    let peripheral = server.peripheral();
+
+    let host_hex: String = host_id.iter().map(|b| format!("{b:02x}")).collect();
+    let instance = format!("deunlock-{}", &host_hex[..8]);
+    let advertiser = match local_ipv4() {
+        Some(ip) => {
+            let fingerprint = identity.fingerprint_hex();
+            match deunlock_net::LanAdvertiser::start(&instance, &host_hex, &fingerprint, ip, port) {
+                Ok(advertiser) => {
+                    tracing::info!(service = %advertiser.fullname(), %ip, port, "LAN transport ready");
+                    Some(advertiser)
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "mdns advertisement failed; LAN still listening");
+                    None
+                }
+            }
+        }
+        None => {
+            tracing::warn!(%addr, "no LAN IPv4 address to advertise; phone must use the address directly");
+            None
+        }
+    };
+
+    // The advertisement and the stop sender are held *inside* the task, so they
+    // live exactly as long as the listener does: no `mem::forget`, and the
+    // channel never looks like a stop signal.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        // `stop_tx` must move *into* the task: if it is dropped when this
+        // function returns, the receiver sees a closed channel and the listener
+        // would stop itself immediately.
+        let _stop_guard = stop_tx;
+        server.serve_advertised(advertiser, stop_rx).await;
+    });
+    Some(peripheral)
+}
+
+/// Best-effort primary LAN IPv4 (the address a default route would use).
+fn local_ipv4() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    // No packet is sent: `connect` on a UDP socket only selects the route.
+    socket.connect((std::net::Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then_some(ip)
+}
+
+/// `1`, `true`, `yes`, `on` enable a feature flag; anything else does not.
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => false,
+    }
+}
+
 /// Construct and spawn an orchestrator, including pairing with zero bonds.
 /// Bluetooth initialization failures propagate so systemd retries on the
 /// available controller. Store failures return an absent orchestrator, which
@@ -344,6 +447,7 @@ async fn wait_for_reason(
 /// short-circuit before any BlueZ DBus call is made.
 async fn maybe_spawn_orchestrator(
     config: &Config,
+    host_id: Option<[u8; 32]>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<
     (
@@ -376,6 +480,18 @@ async fn maybe_spawn_orchestrator(
             }
         },
         PeripheralMode::Fake => (seed_fake_peripheral(config), None),
+    };
+    // Wi-Fi is opt-in (`DEUNLOCK_LAN=1`): a second backend behind the same
+    // `Peripheral` seam, so the orchestrator and the protocol code never learn
+    // which transport the phone is on. A failure here is logged and skipped —
+    // losing Wi-Fi must not cost the user their Bluetooth path.
+    let peripheral: Arc<dyn Peripheral + Send + Sync> = match start_lan(config, host_id).await {
+        Some(lan) => {
+            let composite = CompositePeripheral::new(vec![("ble", Arc::clone(&peripheral)), ("lan", lan)]);
+            tracing::info!(backends = ?composite.backend_names(), "transports wired");
+            composite
+        }
+        None => peripheral,
     };
     // Load any pre-existing non-revoked bond into the orchestrator's
     // seed peer set. With zero bonds the seed is empty — the

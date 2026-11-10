@@ -815,7 +815,10 @@ dependencies = [
 name = "deunlock-net"
 version = "0.3.0"
 dependencies = [
+ "async-trait",
  "blake3",
+ "deunlock-core",
+ "deunlock-transport",
  "mdns-sd",
  "rcgen",
  "rustls",
@@ -825,6 +828,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -849,10 +853,13 @@ name = "deunlock-presenced"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "ciborium",
  "clap",
  "deunlock-core",
+ "deunlock-net",
  "deunlock-transport",
+ "futures",
  "getrandom 0.3.4",
  "hex",
  "libc",

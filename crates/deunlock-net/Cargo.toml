@@ -22,7 +22,14 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+deunlock-core = { path = "../deunlock-core" }
+# Trait only: the LAN backend plugs into the same `Peripheral` seam as BLE, so no
+# protocol code depends on which transport is live. `test-fake` is off: the
+# fake never ships in a daemon.
+deunlock-transport = { path = "../deunlock-transport", default-features = false }
+async-trait = "0.1.92"
 blake3 = "1"
+uuid = "1"
 mdns-sd = "0.11"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
