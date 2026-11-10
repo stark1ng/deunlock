@@ -23,6 +23,7 @@
 pub mod bond;
 pub mod challenge;
 pub mod frame;
+pub mod host;
 pub mod kex;
 pub mod mac;
 pub mod replay;
@@ -32,6 +33,10 @@ pub mod transcript;
 
 pub use challenge::{
     CHALLENGE_FRAME_NONCE_LEN, CHALLENGE_V2_MAGIC, ChallengeError, ChallengeV2, MIN_CHALLENGE_V2_PAYLOAD_LEN,
+};
+pub use host::{
+    DEFAULT_HOST_KEY_PATH, HOST_ID_BYTES, HOST_KEY_DIR_MODE, HOST_KEY_FILE_MODE, HOST_KEY_PUBLIC_BYTES, HOST_KEY_SECRET_BYTES, HostError,
+    HostIdentity,
 };
 pub use kex::{
     AUTH_MAC_KEY_BYTES, AUTH_MAC_KEY_INFO_V2, BOND_KEY_V2_BYTES, KEX_INFO_V2, KexError, PAIRING_NONCE_LEN, PairingSecret, SEC1_PUBKEY_LEN,

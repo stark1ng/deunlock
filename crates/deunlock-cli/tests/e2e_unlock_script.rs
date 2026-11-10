@@ -90,14 +90,7 @@ fn write_synthetic_audit(td: &TempDir, elapsed_ms: &[u64]) -> PathBuf {
         let t_start = t0 + (i as u64) * 1_000;
         let t_end = t_start + e;
         buf.push_str(&format!(
-            "{peer}{sep}{nonce}{sep}{ts}{sep}{te}{sep}{outcome}{sep}{reason}\n",
-            peer = FIXTURE_PEER_ID,
-            nonce = FIXTURE_NONCE_HEX,
-            ts = t_start,
-            te = t_end,
-            outcome = FIXTURE_OUTCOME,
-            reason = FIXTURE_REASON,
-            sep = AUDIT_FIELD_SEPARATOR,
+            "{FIXTURE_PEER_ID}{AUDIT_FIELD_SEPARATOR}{FIXTURE_NONCE_HEX}{AUDIT_FIELD_SEPARATOR}{t_start}{AUDIT_FIELD_SEPARATOR}{t_end}{AUDIT_FIELD_SEPARATOR}{FIXTURE_OUTCOME}{AUDIT_FIELD_SEPARATOR}{FIXTURE_REASON}\n"
         ));
     }
     fs::write(&path, buf).expect("write fixture audit");

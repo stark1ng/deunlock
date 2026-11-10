@@ -92,6 +92,7 @@ fn pair_opts(td: &TempDir, peer_filter: Option<&str>, timeout_secs: u64, yes: bo
         peer: peer_filter.map(str::to_owned),
         timeout_secs,
         bond_dir: bond_dir_path(td),
+        host_key: bond_dir_path(td).join("host.key"),
         yes,
         waybar: false,
         // S-019 added the hidden `--scripted-oob` flag; the S-011 cases

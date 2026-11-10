@@ -133,6 +133,14 @@ pub struct PairOpts {
     #[arg(long, default_value = DEFAULT_BOND_DIR)]
     pub bond_dir: PathBuf,
 
+    /// Path to the desktop's persistent Ed25519 identity.
+    ///
+    /// Created on first pair with mode `0600`. The phone pins the matching
+    /// public key, so the same identity must be used for every later pairing
+    /// and by the daemon.
+    #[arg(long, default_value = deunlock_core::DEFAULT_HOST_KEY_PATH)]
+    pub host_key: PathBuf,
+
     /// Skip the interactive `[y/N]` OOB confirmation prompt. Tests only.
     /// Does NOT skip any safety-relevant gate (adapter LESC check, ambiguous
     /// peer check).
@@ -1203,6 +1211,7 @@ mod tests {
             peer: None,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             bond_dir: td.path().join("deunlock"),
+            host_key: td.path().join("deunlock").join("host.key"),
             yes: false,
             waybar: false,
             scripted_oob: Some(SCRIPTED_TEST_OOB_HEX.to_owned()),
@@ -1239,6 +1248,7 @@ mod tests {
             peer: None,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             bond_dir: td.path().join("deunlock"),
+            host_key: td.path().join("deunlock").join("host.key"),
             yes: true,
             waybar: false,
             scripted_oob: None,

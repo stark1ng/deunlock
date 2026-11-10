@@ -28,7 +28,7 @@ use deunlock_cli::{
     status::{StatusOpts, run_status},
     uninstall_pam::{self, UninstallOpts, UninstallOutcome},
 };
-use deunlock_core::SigningKey;
+use deunlock_core::HostIdentity;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -41,10 +41,6 @@ struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
 }
-
-/// Length of the Ed25519 secret seed behind the per-invocation host pair
-/// key (`deunlock_core::SigningKey::from_bytes`).
-const SIGNING_KEY_SECRET_BYTES: usize = 32;
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
@@ -119,16 +115,15 @@ async fn dispatch(cli: Cli) -> Result<()> {
 
 /// Drive the pair flow against the real adapter.
 ///
-/// The host's pair-time key is generated per invocation and never
-/// persisted: the phone uses it only as HKDF input, and the derived
-/// `bond_key` is committed to disk once at pair time. This mirrors
-/// `deunlock-presenced`, which likewise keeps a non-persisted host pubkey
-/// for the pair service.
+/// The host's identity is loaded from `--host-key` (created on first use,
+/// mode `0600`) rather than generated per invocation. Until v0.4 this flow
+/// minted a throwaway key each run, which meant the phone pinned a public key
+/// that no longer existed afterwards — see `deunlock_core::host` and
+/// AUDIT-001 D-02.
 async fn run_pair_cli(opts: &PairOpts) -> Result<()> {
-    let mut secret = [0u8; SIGNING_KEY_SECRET_BYTES];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
-    let signing_key = SigningKey::from_bytes(&secret);
-    let backend = BluerPairBackend::new(&opts.adapter, &signing_key);
+    let identity = HostIdentity::load_or_create(&opts.host_key)
+        .map_err(|err| anyhow::anyhow!("host identity at {}: {err}", opts.host_key.display()))?;
+    let backend = BluerPairBackend::new(&opts.adapter, identity.signing_key());
     run_pair(opts, &backend).await?;
     Ok(())
 }
