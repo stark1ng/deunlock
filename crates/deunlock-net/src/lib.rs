@@ -28,7 +28,7 @@ pub mod tls;
 pub use error::NetError;
 pub use framing::{MAX_MESSAGE_BYTES, read_message, write_message};
 pub use lan::{
-    BondLookup, DEFAULT_LAN_PORT, DEFAULT_NET_CERT_PATH, DEFAULT_NET_KEY_PATH, EXPORTER_LABEL, HELLO_DOMAIN, HELLO_LEN, HELLO_MAGIC, HELLO_TAG_BYTES, Hello, LanPeripheral, LanServer, PEER_ID_BYTES,
+    BondLookup, DEFAULT_LAN_PORT, DEFAULT_NET_CERT_PATH, DEFAULT_NET_KEY_PATH, HELLO_DOMAIN, HELLO_LEN, HELLO_MAGIC, SESSION_CHALLENGE_LEN, SESSION_CHALLENGE_MAGIC, SESSION_NONCE_BYTES, HELLO_TAG_BYTES, Hello, LanPeripheral, LanServer, PEER_ID_BYTES,
     encode_hello, hello_tag, peer_id_hex, verify_hello,
 };
 pub use identity::{FINGERPRINT_BYTES, IDENTITY_DIR_MODE, IDENTITY_FILE_MODE, LanIdentity};

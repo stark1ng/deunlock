@@ -30,8 +30,8 @@ fn probe_pair_uuid() {
     let mobile_uuid = uuid::Uuid::from_bytes(mobile_uuid_bytes);
 
     println!("minute = {minute}");
-    println!("transport bytes  = {:02x?}", transport_bytes);
-    println!("mobile bytes     = {:02x?}", mobile_bytes);
+    println!("transport bytes  = {transport_bytes:02x?}");
+    println!("mobile bytes     = {mobile_bytes:02x?}");
     println!("transport UUID   = {transport_uuid}");
     println!("mobile UUID      = {mobile_uuid}");
     println!("byte-equal       = {}", transport_bytes.as_slice() == mobile_bytes.as_slice());

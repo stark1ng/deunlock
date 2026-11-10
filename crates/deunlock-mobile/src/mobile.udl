@@ -51,6 +51,11 @@ namespace deunlock_mobile {
   [Throws=MobileError]
   bytes build_response_signature(bytes bond_key, FrameSigner signer, bytes frame_bytes);
 
+  // Encode the first message of a Wi-Fi session (hello). The exporter is TLS
+  // keying material for the live connection, so the record is dead on any other.
+  [Throws=MobileError]
+  bytes build_lan_hello(bytes bond_key, bytes host_id, bytes peer_id, bytes exporter);
+
   // Derive the 4-word emoji-prefixed OOB code for `bond_key`. Mirrors
   // `crates/deunlock-cli/src/oob.rs::oob_code_for_bond`.
   [Throws=MobileError]

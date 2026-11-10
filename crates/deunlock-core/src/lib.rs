@@ -23,6 +23,7 @@
 pub mod bond;
 pub mod challenge;
 pub mod frame;
+pub mod hello;
 pub mod host;
 pub mod kex;
 pub mod mac;
@@ -33,6 +34,9 @@ pub mod transcript;
 
 pub use challenge::{
     CHALLENGE_FRAME_NONCE_LEN, CHALLENGE_V2_MAGIC, ChallengeError, ChallengeV2, MIN_CHALLENGE_V2_PAYLOAD_LEN,
+};
+pub use hello::{
+    HELLO_DOMAIN, HELLO_LEN, HELLO_MAGIC, HELLO_TAG_BYTES, Hello, HelloError, PEER_ID_BYTES, SESSION_CHALLENGE_LEN, SESSION_CHALLENGE_MAGIC, SESSION_NONCE_BYTES, decode_hello, decode_session_challenge, encode_hello, encode_session_challenge, hello_tag, peer_id_hex, verify_hello,
 };
 pub use host::{
     DEFAULT_HOST_KEY_PATH, HOST_ID_BYTES, HOST_KEY_DIR_MODE, HOST_KEY_FILE_MODE, HOST_KEY_PUBLIC_BYTES, HOST_KEY_SECRET_BYTES, HostError,

@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use deunlock_core::{BOND_KEY_BYTES, NONCE_LEN};
+use deunlock_core::NONCE_LEN;
 use deunlock_transport::{BondKey, Peripheral, PeripheralError};
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpListener;
@@ -46,107 +46,15 @@ pub const DEFAULT_NET_CERT_PATH: &str = "/etc/deunlock/net.crt";
 /// Default private-key path.
 pub const DEFAULT_NET_KEY_PATH: &str = "/etc/deunlock/net.key";
 
-/// Magic of the hello record.
-pub const HELLO_MAGIC: [u8; 4] = *b"DLH1";
-
-/// Domain separator for the hello tag.
-pub const HELLO_DOMAIN: &[u8] = b"deunlock-lan-hello-v1";
-
-/// TLS exporter label. Both ends must use the same value.
-pub const EXPORTER_LABEL: &[u8] = b"deunlock-lan-v1";
-
-/// Length of the hello tag.
-pub const HELLO_TAG_BYTES: usize = 32;
-
-/// Length of the TLS exporter context.
-pub const EXPORTER_BYTES: usize = 32;
-
-/// Length of a peer id.
-pub const PEER_ID_BYTES: usize = 32;
-
-/// Total length of an encoded hello.
-pub const HELLO_LEN: usize = HELLO_MAGIC.len() + 32 + PEER_ID_BYTES + EXPORTER_BYTES + HELLO_TAG_BYTES;
-
-/// What a verified hello tells us.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Hello {
-    /// Desktop the phone believes it is talking to.
-    pub host_id: [u8; 32],
-    /// Peer id of the calling phone.
-    pub peer_id: [u8; PEER_ID_BYTES],
-    /// Session exporter the tag covered.
-    pub exporter: [u8; EXPORTER_BYTES],
-}
-
-/// Compute the hello tag binding host, peer and session together.
-///
-/// The length prefixes are not needed here: every field is fixed width, so the
-/// concatenation is unambiguous by construction.
-#[must_use]
-pub fn hello_tag(mac_key: &[u8; BOND_KEY_BYTES], host_id: &[u8; 32], peer_id: &[u8; PEER_ID_BYTES], exporter: &[u8; EXPORTER_BYTES]) -> [u8; HELLO_TAG_BYTES] {
-    let mut message = Vec::with_capacity(HELLO_DOMAIN.len() + 96);
-    message.extend_from_slice(HELLO_DOMAIN);
-    message.extend_from_slice(host_id);
-    message.extend_from_slice(peer_id);
-    message.extend_from_slice(exporter);
-    // A full 32-byte tag: the hello is the only thing standing between an open
-    // TLS port and the challenge channel, so it gets the whole digest rather
-    // than the 16-byte truncation used for frame MACs.
-    *blake3::keyed_hash(mac_key, &message).as_bytes()
-}
-
-/// Encode the hello a phone sends as its first message.
-#[must_use]
-pub fn encode_hello(
-    mac_key: &[u8; BOND_KEY_BYTES],
-    host_id: &[u8; 32],
-    peer_id: &[u8; PEER_ID_BYTES],
-    exporter: &[u8; EXPORTER_BYTES],
-) -> Vec<u8> {
-    let tag = hello_tag(mac_key, host_id, peer_id, exporter);
-    let mut out = Vec::with_capacity(HELLO_LEN);
-    out.extend_from_slice(&HELLO_MAGIC);
-    out.extend_from_slice(host_id);
-    out.extend_from_slice(peer_id);
-    out.extend_from_slice(exporter);
-    out.extend_from_slice(&tag);
-    out
-}
-
-/// Hex-encode a peer id for the bonds files, which key peers by string.
-#[must_use]
-pub fn peer_id_hex(peer_id: &[u8; PEER_ID_BYTES]) -> String {
-    peer_id.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Parsed-but-unverified hello.
-fn split_hello(bytes: &[u8]) -> Result<(Hello, [u8; HELLO_TAG_BYTES]), NetError> {
-    if bytes.len() != HELLO_LEN {
-        return Err(NetError::Handshake(format!(
-            "hello has {} bytes, expected {HELLO_LEN}",
-            bytes.len()
-        )));
-    }
-    if bytes[..4] != HELLO_MAGIC {
-        return Err(NetError::Handshake("hello magic mismatch".to_owned()));
-    }
-    let mut host_id = [0u8; 32];
-    host_id.copy_from_slice(&bytes[4..36]);
-    let mut peer_id = [0u8; PEER_ID_BYTES];
-    peer_id.copy_from_slice(&bytes[36..68]);
-    let mut exporter = [0u8; EXPORTER_BYTES];
-    exporter.copy_from_slice(&bytes[68..100]);
-    let mut tag = [0u8; HELLO_TAG_BYTES];
-    tag.copy_from_slice(&bytes[100..132]);
-    Ok((
-        Hello {
-            host_id,
-            peer_id,
-            exporter,
-        },
-        tag,
-    ))
-}
+// The hello record itself lives in `deunlock-core`: it is a protocol message the
+// desktop and the phone must produce byte-for-byte identically, so there is
+// exactly one implementation. This module adds the transport-side policy — who
+// is bonded, and how a session is attached.
+pub use deunlock_core::hello::{
+    HELLO_DOMAIN, HELLO_LEN, HELLO_MAGIC, HELLO_TAG_BYTES, Hello, PEER_ID_BYTES, SESSION_CHALLENGE_LEN, SESSION_CHALLENGE_MAGIC,
+    SESSION_NONCE_BYTES, decode_hello, decode_session_challenge, encode_hello, encode_session_challenge, hello_tag,
+    peer_id_hex,
+};
 
 /// Supplies bond keys by peer id; the daemon backs this with its keys directory.
 pub trait BondLookup: Send + Sync {
@@ -163,50 +71,30 @@ where
     }
 }
 
-/// Verify a hello against our own identity and the bond for the claimed peer.
+/// Verify a hello against our own identity, the session nonce we just sent, and
+/// the bond for the claimed peer.
+///
+/// The tag check itself lives in `deunlock-core::hello`; this adds the lookup
+/// that decides *which* key the peer claims.
 ///
 /// # Errors
 ///
-/// [`NetError::Handshake`] for a malformed record or a host id that is not ours,
-/// [`NetError::PinMismatch`] when the peer is not bonded (the phone is talking to
-/// a desktop it never paired with, or the bond was revoked), and
-/// [`NetError::Handshake`] for a tag that does not verify.
+/// [`NetError::Handshake`] for a malformed record, a wrong host id or session
+/// nonce, or a tag that does not verify; [`NetError::PinMismatch`] when the peer is not
+/// bonded (the phone is talking to a desktop it never paired with, or its bond
+/// was revoked).
 pub fn verify_hello(
     bytes: &[u8],
     our_host_id: &[u8; 32],
-    exporter: &[u8; EXPORTER_BYTES],
+    session_nonce: &[u8; SESSION_NONCE_BYTES],
     bonds: &dyn BondLookup,
 ) -> Result<Hello, NetError> {
-    let (hello, tag) = split_hello(bytes)?;
-    if &hello.host_id != our_host_id {
-        return Err(NetError::Handshake(
-            "hello is addressed to a different host_id".to_owned(),
-        ));
-    }
-    if &hello.exporter != exporter {
-        return Err(NetError::Handshake(
-            "hello was produced for a different TLS session".to_owned(),
-        ));
-    }
+    let (hello, _tag) = deunlock_core::decode_hello(bytes)
+        .map_err(|e| NetError::Handshake(format!("hello decode failed: {e}")))?;
     let peer_hex = peer_id_hex(&hello.peer_id);
     let bond = bonds.bond_key(&peer_hex).ok_or(NetError::PinMismatch)?;
-    let mac_key = deunlock_core::derive_auth_mac_key(&bond);
-    let expected = hello_tag(&mac_key, our_host_id, &hello.peer_id, exporter);
-    if !constant_time_eq(&expected, &tag) {
-        return Err(NetError::Handshake("hello tag did not verify".to_owned()));
-    }
-    Ok(hello)
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    deunlock_core::verify_hello(bytes, &bond, our_host_id, session_nonce)
+        .map_err(|e| NetError::Handshake(e.to_string()))
 }
 
 /// A live session attached to a peer.
@@ -439,6 +327,18 @@ impl LanServer {
     }
 }
 
+
+/// A fresh 32-byte session nonce from the OS RNG.
+///
+/// Failure is not recoverable and must not be papered over with a weak value:
+/// the nonce is what makes a recorded hello useless on another connection.
+fn random_session_nonce() -> [u8; SESSION_NONCE_BYTES] {
+    use rand_core::RngCore as _;
+    let mut nonce = [0u8; SESSION_NONCE_BYTES];
+    rand_core::OsRng.fill_bytes(&mut nonce);
+    nonce
+}
+
 async fn handle_connection(
     acceptor: TlsAcceptor,
     tcp: tokio::net::TcpStream,
@@ -452,17 +352,16 @@ async fn handle_connection(
         .await
         .map_err(|e| NetError::Handshake(e.to_string()))?;
 
-    let exporter = {
-        let (_, conn) = tls.get_ref();
-        let mut out = [0u8; EXPORTER_BYTES];
-        conn.export_keying_material(&mut out[..], EXPORTER_LABEL, None)
-            .map_err(|e| NetError::Handshake(format!("exporter failed: {e}")))?;
-        out
-    };
+    // The desktop speaks first: a fresh nonce the phone must cover in its hello.
+    // Android has no TLS-exporter API, so this is how the hello is bound to this
+    // specific connection.
+    let session_nonce = random_session_nonce();
+    let mut tls = tls;
+    write_message(&mut tls, &encode_session_challenge(&session_nonce)).await?;
 
     let (mut reader, mut writer) = tokio::io::split(tls);
     let hello_bytes = read_message(&mut reader).await?;
-    let hello = verify_hello(&hello_bytes, &host_id, &exporter, bonds.as_ref())?;
+    let hello = verify_hello(&hello_bytes, &host_id, &session_nonce, bonds.as_ref())?;
     let peer_hex = peer_id_hex(&hello.peer_id);
     tracing::info!(peer = %peer_hex, addr = %peer_addr, "LAN session authenticated");
 

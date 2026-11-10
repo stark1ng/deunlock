@@ -571,7 +571,44 @@ pub fn build_response_signature(
 }
 
 // ---------------------------------------------------------------------------
-// 6. session_uuid_for_bond
+// 6. build_lan_hello — first message on a Wi-Fi session
+// ---------------------------------------------------------------------------
+
+/// Encode the hello a phone sends as the first message of a LAN session.
+///
+/// `session_nonce` is the 32-byte nonce the desktop sends immediately after the
+/// TLS handshake (`"DLS1" ‖ nonce`). The desktop compares the tag against the
+/// nonce it generated for this connection, so the record is worthless on any
+/// other session.
+///
+/// # Errors
+///
+/// [`MobileError::InvalidKey`] when `bond_key` is not 32 bytes, or when
+/// `host_id`/`peer_id` are not 32 bytes each, or `exporter` is not 32 bytes.
+pub fn build_lan_hello(
+    bond_key: Vec<u8>,
+    host_id: Vec<u8>,
+    peer_id: Vec<u8>,
+    session_nonce: Vec<u8>,
+) -> Result<Vec<u8>, MobileError> {
+    let bond = bond_key_array(&bond_key)?;
+    let host: [u8; 32] = host_id.as_slice().try_into().map_err(|_| MobileError::InvalidKey {
+        reason: format!("host_id must be 32 bytes, got {}", host_id.len()),
+    })?;
+    let peer: [u8; deunlock_core::PEER_ID_BYTES] = peer_id.as_slice().try_into().map_err(|_| MobileError::InvalidKey {
+        reason: format!("peer_id must be 32 bytes, got {}", peer_id.len()),
+    })?;
+    let nonce: [u8; deunlock_core::SESSION_NONCE_BYTES] = session_nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| MobileError::InvalidKey {
+            reason: format!("session_nonce must be 32 bytes, got {}", session_nonce.len()),
+        })?;
+    Ok(deunlock_core::encode_hello(&bond, &host, &peer, &nonce))
+}
+
+// ---------------------------------------------------------------------------
+// 7. session_uuid_for_bond
 // ---------------------------------------------------------------------------
 
 /// HKDF info string for the rotating session UUID derivation. Mirrors
@@ -1405,6 +1442,43 @@ mod tests {
         let outcome = build_response_signature([0x43u8; BOND_KEY_BYTES].to_vec(), signer, frame_bytes);
         assert!(matches!(outcome, Err(MobileError::VerifyFailed { .. })));
         assert!(captured.lock().expect("slot").is_none(), "no signature without a verified MAC");
+    }
+
+    #[test]
+    fn the_phone_hello_verifies_against_the_desktop_implementation() {
+        // Cross-implementation vector: the phone encodes, the desktop verifies.
+        // One side writing a different layout would pass both unit suites and
+        // fail only on a real device.
+        let bond = [0x33u8; BOND_KEY_BYTES];
+        let host = [0x11u8; 32];
+        let peer = [0x22u8; deunlock_core::PEER_ID_BYTES];
+        let session_nonce = [0x44u8; deunlock_core::SESSION_NONCE_BYTES];
+
+        let bytes = build_lan_hello(bond.to_vec(), host.to_vec(), peer.to_vec(), session_nonce.to_vec()).expect("hello");
+        assert_eq!(bytes.len(), deunlock_core::HELLO_LEN);
+
+        let hello = deunlock_core::verify_hello(&bytes, &bond, &host, &session_nonce).expect("desktop accepts");
+        assert_eq!(hello.peer_id, peer);
+        assert_eq!(hello.host_id, host);
+    }
+
+    #[test]
+    fn a_hello_for_another_session_is_rejected_by_the_desktop() {
+        let bond = [0x33u8; BOND_KEY_BYTES];
+        let host = [0x11u8; 32];
+        let peer = [0x22u8; deunlock_core::PEER_ID_BYTES];
+        let bytes = build_lan_hello(bond.to_vec(), host.to_vec(), peer.to_vec(), [0x44u8; 32].to_vec()).expect("hello");
+        // A different TLS session exports different material.
+        assert!(deunlock_core::verify_hello(&bytes, &bond, &host, &[0x45u8; 32]).is_err());
+    }
+
+    #[test]
+    fn a_hello_with_wrong_sized_parts_is_refused_before_encoding() {
+        let bond = [0x33u8; BOND_KEY_BYTES];
+        assert!(build_lan_hello(bond.to_vec(), vec![0u8; 31], vec![0u8; 32], vec![0u8; 32]).is_err());
+        assert!(build_lan_hello(bond.to_vec(), vec![0u8; 32], vec![0u8; 33], vec![0u8; 32]).is_err());
+        assert!(build_lan_hello(bond.to_vec(), vec![0u8; 32], vec![0u8; 32], vec![0u8; 16]).is_err());
+        assert!(build_lan_hello(vec![0u8; 31], vec![0u8; 32], vec![0u8; 32], vec![0u8; 32]).is_err());
     }
 
 }

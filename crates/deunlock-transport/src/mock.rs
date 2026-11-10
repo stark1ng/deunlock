@@ -349,9 +349,7 @@ mod tests {
         assert_eq!(response.payload, want_payload);
         assert!(
             elapsed < GOLDEN_ROUNDTRIP_BUDGET,
-            "golden roundtrip exceeded budget: {:?} >= {:?}",
-            elapsed,
-            GOLDEN_ROUNDTRIP_BUDGET
+            "golden roundtrip exceeded budget: {elapsed:?} >= {GOLDEN_ROUNDTRIP_BUDGET:?}"
         );
     }
 
@@ -377,9 +375,7 @@ mod tests {
         let upper_bound = SHORT_CALLER_TIMEOUT * TIMEOUT_BUDGET_MULT;
         assert!(
             elapsed < upper_bound,
-            "elapsed {:?} >= upper_bound {:?} (caller timeout did not fire)",
-            elapsed,
-            upper_bound
+            "elapsed {elapsed:?} >= upper_bound {upper_bound:?} (caller timeout did not fire)"
         );
         // Sanity: the upper bound must be strictly less than the mock's delay,
         // otherwise this test cannot distinguish caller-timeout from

@@ -31,6 +31,7 @@ async-trait = "0.1.92"
 blake3 = "1"
 uuid = "1"
 mdns-sd = "0.11"
+rand_core = { version = "0.6", features = ["getrandom"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 sha2 = "0.10"
