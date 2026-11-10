@@ -29,6 +29,7 @@ pub mod kex;
 pub mod mac;
 pub mod replay;
 pub mod qr_pair;
+pub mod qr_pairing;
 pub mod secrets;
 pub mod sign;
 pub mod transcript;
@@ -61,6 +62,11 @@ pub use frame::{
 };
 pub use mac::{BOND_KEY_BYTES, MAC_TAG_LEN, compute_tag, verify_tag};
 pub use replay::{Acceptance, DEFAULT_REPLAY_CAP, DEFAULT_REPLAY_TTL, ReplayCache};
+pub use qr_pairing::{
+    PAIR_ACCEPT_LEN, PAIR_ACCEPT_MAGIC, PAIR_REQUEST_LEN, PAIR_REQUEST_MAGIC, PAIR_TAG_BYTES, PHONE_PUBKEY_BYTES, PairError,
+    derive_qr_bond_key, encode_pair_accept, encode_pair_request, verify_pair_accept,
+    verify_pair_request,
+};
 pub use qr_pair::{MAX_HOST_BYTES, PAIRING_SECRET_BYTES, PairingOffer, QrError, QR_PREFIX, QR_VERSION};
 pub use secrets::{
     BackendKind, InMemoryKeyStore, KEYRING_ID_PREFIX, KeyStore, LOG_LINE_KERNEL, LOG_LINE_SECRET_SERVICE, SECRET_SERVICE_ATTR_ID,

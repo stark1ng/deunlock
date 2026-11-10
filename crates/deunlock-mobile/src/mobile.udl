@@ -51,6 +51,20 @@ namespace deunlock_mobile {
   [Throws=MobileError]
   bytes build_response_signature(bytes bond_key, FrameSigner signer, bytes frame_bytes);
 
+  // Derive the bond from a scanned QR pairing secret. The desktop derives the
+  // same key after verifying the request, so it never crosses the network.
+  [Throws=MobileError]
+  bytes derive_qr_bond(bytes secret, bytes host_id, bytes phone_pubkey);
+
+  // Build the DLP1 pairing request for the scanned secret.
+  [Throws=MobileError]
+  bytes build_pair_request(bytes secret, bytes host_id, bytes phone_pubkey);
+
+  // Check the desktop's DLP2 acceptance. false = this machine did not hold the
+  // scanned code.
+  [Throws=MobileError]
+  boolean verify_pair_accept(bytes secret, bytes host_id, bytes phone_pubkey, bytes accept);
+
   // Encode the first message of a Wi-Fi session (hello). The exporter is TLS
   // keying material for the live connection, so the record is dead on any other.
   [Throws=MobileError]

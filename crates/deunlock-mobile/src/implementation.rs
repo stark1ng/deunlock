@@ -971,6 +971,81 @@ pub static OOB_WORDS: [&str; 256] = [
 // Tests — at least one happy-path and one negative-path per UDL function.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 8. QR pairing — the phone's half
+// ---------------------------------------------------------------------------
+
+/// Derive the bond from a scanned QR secret.
+///
+/// The desktop derives the same key after verifying our request, so the bond
+/// never crosses the network. `phone_pubkey` is this device's Ed25519 public key
+/// (the one `peer_id` hashes), so no second key pair is minted for pairing.
+///
+/// # Errors
+///
+/// [`MobileError::InvalidKey`] when any input is the wrong length or the phone
+/// key is all zeroes.
+pub fn derive_qr_bond(secret: Vec<u8>, host_id: Vec<u8>, phone_pubkey: Vec<u8>) -> Result<Vec<u8>, MobileError> {
+    let (secret, host, phone) = qr_inputs(&secret, &host_id, &phone_pubkey)?;
+    Ok(deunlock_core::derive_qr_bond_key(&secret, &host, &phone).to_vec())
+}
+
+/// Build the `DLP1` pairing request for the scanned secret.
+///
+/// # Errors
+///
+/// [`MobileError::InvalidKey`] as for [`derive_qr_bond`].
+pub fn build_pair_request(secret: Vec<u8>, host_id: Vec<u8>, phone_pubkey: Vec<u8>) -> Result<Vec<u8>, MobileError> {
+    let (secret, host, phone) = qr_inputs(&secret, &host_id, &phone_pubkey)?;
+    Ok(deunlock_core::encode_pair_request(&secret, &host, &phone))
+}
+
+/// Check the desktop's `DLP2` acceptance.
+///
+/// Returns `false` for a tag mismatch rather than an error: "this machine did not
+/// hold my code" is an answer, not a malfunction. A malformed record is an error.
+///
+/// # Errors
+///
+/// [`MobileError::InvalidKey`] for wrong-length inputs, [`MobileError::BadFrame`]
+/// for a record that is not an acceptance.
+pub fn verify_pair_accept(
+    secret: Vec<u8>,
+    host_id: Vec<u8>,
+    phone_pubkey: Vec<u8>,
+    accept: Vec<u8>,
+) -> Result<bool, MobileError> {
+    let (secret, host, phone) = qr_inputs(&secret, &host_id, &phone_pubkey)?;
+    match deunlock_core::verify_pair_accept(&accept, &secret, &host, &phone) {
+        Ok(()) => Ok(true),
+        Err(deunlock_core::PairError::TagMismatch) => Ok(false),
+        Err(err) => Err(MobileError::BadFrame {
+            reason: err.to_string(),
+        }),
+    }
+}
+
+/// The three fixed-width inputs every QR pairing call needs.
+type QrInputs = ([u8; 32], [u8; 32], [u8; deunlock_core::PHONE_PUBKEY_BYTES]);
+
+fn qr_inputs(secret: &[u8], host_id: &[u8], phone_pubkey: &[u8]) -> Result<QrInputs, MobileError> {
+    let secret: [u8; 32] = secret.try_into().map_err(|_| MobileError::InvalidKey {
+        reason: format!("pairing secret must be 32 bytes, got {}", secret.len()),
+    })?;
+    let host: [u8; 32] = host_id.try_into().map_err(|_| MobileError::InvalidKey {
+        reason: format!("host_id must be 32 bytes, got {}", host_id.len()),
+    })?;
+    let phone: [u8; deunlock_core::PHONE_PUBKEY_BYTES] = phone_pubkey.try_into().map_err(|_| MobileError::InvalidKey {
+        reason: format!("phone public key must be 32 bytes, got {}", phone_pubkey.len()),
+    })?;
+    if phone == [0u8; deunlock_core::PHONE_PUBKEY_BYTES] {
+        return Err(MobileError::InvalidKey {
+            reason: "phone public key is empty".to_owned(),
+        });
+    }
+    Ok((secret, host, phone))
+}
+
 #[cfg(test)]
 mod tests {
     use deunlock_core::{HEADER_LEN, NONCE_LEN, DEUNLOCK_WIRE_VERSION_V1, TAG_LEN};
@@ -1479,6 +1554,50 @@ mod tests {
         assert!(build_lan_hello(bond.to_vec(), vec![0u8; 32], vec![0u8; 33], vec![0u8; 32]).is_err());
         assert!(build_lan_hello(bond.to_vec(), vec![0u8; 32], vec![0u8; 32], vec![0u8; 16]).is_err());
         assert!(build_lan_hello(vec![0u8; 31], vec![0u8; 32], vec![0u8; 32], vec![0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn the_phone_and_the_desktop_agree_on_the_bond_from_a_scanned_code() {
+        let secret = [0x44u8; 32];
+        let host = [0x11u8; 32];
+        let phone = [0x22u8; 32];
+
+        let request = build_pair_request(secret.to_vec(), host.to_vec(), phone.to_vec()).expect("request");
+        // Desktop side: verify the request, then derive.
+        let desktop_key = deunlock_core::verify_pair_request(&request, &secret, &host).expect("verify");
+        assert_eq!(desktop_key, phone);
+        let desktop_bond = deunlock_core::derive_qr_bond_key(&secret, &host, &desktop_key);
+
+        // Phone side: derive locally, then check the acceptance.
+        let phone_bond = derive_qr_bond(secret.to_vec(), host.to_vec(), phone.to_vec()).expect("bond");
+        assert_eq!(phone_bond, desktop_bond.to_vec());
+
+        let accept = deunlock_core::encode_pair_accept(&secret, &host, &phone);
+        assert!(verify_pair_accept(secret.to_vec(), host.to_vec(), phone.to_vec(), accept).expect("verify accept"));
+    }
+
+    #[test]
+    fn an_acceptance_from_a_machine_that_did_not_hold_the_code_is_false_not_an_error() {
+        let secret = [0x44u8; 32];
+        let host = [0x11u8; 32];
+        let phone = [0x22u8; 32];
+        let forged = deunlock_core::encode_pair_accept(&[0x45u8; 32], &host, &phone);
+        assert!(!verify_pair_accept(secret.to_vec(), host.to_vec(), phone.to_vec(), forged).expect("answer"));
+    }
+
+    #[test]
+    fn a_malformed_acceptance_is_an_error() {
+        let secret = [0x44u8; 32];
+        let host = [0x11u8; 32];
+        let phone = [0x22u8; 32];
+        assert!(verify_pair_accept(secret.to_vec(), host.to_vec(), phone.to_vec(), vec![0u8; 7]).is_err());
+    }
+
+    #[test]
+    fn qr_pairing_refuses_short_inputs_and_an_empty_phone_key() {
+        assert!(derive_qr_bond(vec![0u8; 31], vec![0u8; 32], vec![1u8; 32]).is_err());
+        assert!(derive_qr_bond(vec![0u8; 32], vec![0u8; 31], vec![1u8; 32]).is_err());
+        assert!(derive_qr_bond(vec![0u8; 32], vec![0u8; 32], vec![0u8; 32]).is_err());
     }
 
 }
