@@ -1,0 +1,44 @@
+Source: deunlock
+Section: admin
+Priority: optional
+Maintainer: deunlock contributors <noreply@anthropic.com>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc (>= 1.85),
+               libpam0g-dev,
+               libbluetooth-dev,
+               libsecret-1-dev,
+               libssl-dev,
+               pkg-config,
+               dbus-daemon,
+               gzip
+Standards-Version: 4.6.2
+Homepage: https://github.com/Mewplane/deunlock
+Vcs-Browser: https://github.com/Mewplane/deunlock
+Vcs-Git: https://github.com/Mewplane/deunlock.git
+Rules-Requires-Root: no
+
+Package: deunlock
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         libpam0g (>= 1.5),
+         bluez (>= 5.66),
+         dbus,
+         libsecret-1-0
+Description: Phone-as-key PAM authenticator for Linux
+ deunlock replaces typing a password for PAM-gated actions (sudo,
+ login, lockscreen) with an approve-tap on a paired Android phone.
+ The phone's signing key is unlocked by a fresh biometric per
+ unlock, defeating the NCC link-layer relay class of attacks that
+ broke every prior passive BLE PAM module. On phone-absent or
+ phone-deny, the module returns PAM_AUTHINFO_UNAVAIL and the
+ configured fallback (typically pam_unix) runs, so a dead phone
+ never locks the user out.
+ .
+ The package ships /usr/lib/x86_64-linux-gnu/security/pam_deunlock.so
+ (or the equivalent arm64 multiarch path) plus the `deunlock` CLI
+ at /usr/bin/deunlock. The bond store at /var/lib/deunlock/ is created
+ with mode 0700 by the postinst hook and is preserved across
+ upgrades and uninstalls — to drop a paired phone, run
+ `deunlock revoke <peer>` before purging the package.

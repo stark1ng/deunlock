@@ -1,0 +1,63 @@
+[package]
+name = "deunlock-pam"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Linux PAM module for deunlock phone-as-key unlock (cdylib)."
+
+# Per S-001 DoD: crate-type = ["cdylib", "rlib"] so we get both
+# libpam_deunlock.so for the loader AND an rlib so the inner helpers can be
+# exercised by ordinary Rust unit tests.
+#
+# `name = "pam_deunlock"` is required so the loader resolves
+# `libpam_deunlock.so` — PAM strictly expects the module file name to match the
+# `pam_*` prefix.
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "pam_deunlock"
+path = "src/lib.rs"
+
+[dependencies]
+syslog = "7"
+libc = "0.2"
+# S-008 — `BondStore` lookup still happens in PAM to pick the
+# `peer_id` for the wire frame. The bond_key + pubkey lookup paths
+# moved to the daemon (`deunlock-presenced`).
+deunlock-core = { path = "../deunlock-core" }
+# S-008 — typed `Request` / `Response` enums + the
+# `read_frame_blocking` / `write_frame_blocking` helpers. Both the
+# daemon (tokio path) and the PAM module (blocking path) share one
+# wire-format module.
+deunlock-presenced = { path = "../deunlock-presenced", default-features = false }
+# Fresh nonces use the OS RNG. SPEC §4.2 mandates a 16-byte fresh
+# nonce per challenge; even though the daemon currently generates
+# its own nonce, the PAM-side wire frame still carries a
+# non-trivial one so the field is correctly populated.
+getrandom = "0.3"
+# RFC3339 timestamps in the `last.log` audit line.
+time = { version = "0.3", features = ["formatting", "parsing"] }
+# Typed error variants for the SPEC §6 reason → PAM-code mapping.
+thiserror = "2"
+# `nix::unistd::geteuid` for the `/run/user/$UID` fallback when
+# `XDG_RUNTIME_DIR` is unset (SPEC §8 Risks row).
+nix = { version = "0.29", features = ["user", "fs"] }
+
+[dev-dependencies]
+# Tests bind ephemeral Unix-domain sockets under tempdirs.
+tempfile = "3"
+deunlock-core = { path = "../deunlock-core" }
+deunlock-presenced = { path = "../deunlock-presenced", default-features = false }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+# `ed25519-dalek` for the integration test that signs a synthetic
+# response with a known keypair before injecting it into the
+# daemon's `--peripheral=fake` test seam.
+ed25519-dalek = "2"
+hex = "0.4"
+
+# The workspace bans `unsafe_code` by default, but the entire purpose of this
+# crate is to expose `unsafe extern "C"` symbols across the libpam ABI. We
+# opt out at the crate level only, and every single `unsafe` block carries a
+# `// SAFETY:` comment per `.agents/skills/ffi/SKILL.md`.
+[lints.rust]
+unsafe_code = "allow"

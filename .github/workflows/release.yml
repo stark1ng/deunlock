@@ -1,0 +1,209 @@
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+    branches: ['release/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate the source version and tag
+        id: version
+        run: |
+          python3 - <<'PY'
+          import os, re, tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
+          assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version), version
+          if os.environ['GITHUB_REF_TYPE'] == 'tag':
+              assert os.environ['GITHUB_REF_NAME'] == 'v' + version, 'tag/source version mismatch'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('version=' + version + '\n')
+          PY
+
+  linux:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    container: debian:12
+    steps:
+      - name: Install the Debian 12 build toolchain
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config dbus-daemon libdbus-1-dev libpam0g-dev libbluetooth-dev libssl-dev python3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build locked desktop binaries
+        run: cargo build --locked --release -p deunlock-cli -p deunlock-pam -p deunlock-presenced
+      - name: Build native packages and manual archive
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: scripts/build-linux-packages.sh --version "$VERSION" --arch "$ARCH" --binaries target/release --output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  install-smoke:
+    needs: [version, linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            distro: debian
+          - runner: ubuntu-24.04
+            arch: x86_64
+            distro: ubuntu
+          - runner: ubuntu-24.04
+            arch: x86_64
+            distro: fedora
+          - runner: ubuntu-24.04
+            arch: x86_64
+            distro: arch
+          - runner: ubuntu-24.04
+            arch: x86_64
+            distro: opensuse
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            distro: debian
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            distro: fedora
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist
+      - name: Install, upgrade, execute, and remove the native package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          DISTRO: ${{ matrix.distro }}
+          CONTAINER_ENGINE: docker
+        run: scripts/test-package-install.sh dist "$VERSION" "$ARCH" "$DISTRO"
+
+  android:
+    needs: version
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+      - name: Install pinned Android toolchain
+        run: sdkmanager 'platforms;android-34' 'build-tools;34.0.0' 'ndk;28.0.13004108'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+      - name: Build all four native Android libraries and Kotlin bindings
+        run: NDK_HOME="$ANDROID_HOME/ndk/28.0.13004108" scripts/build_aar.sh
+      - name: Restore the protected release signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.DEUNLOCK_RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$KEYSTORE_BASE64"
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/deunlock-release.jks"
+          echo "DEUNLOCK_RELEASE_KEYSTORE=$RUNNER_TEMP/deunlock-release.jks" >> "$GITHUB_ENV"
+      - name: Build, align, sign, and verify the release APK
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          DEUNLOCK_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.DEUNLOCK_RELEASE_KEYSTORE_PASSWORD }}
+          DEUNLOCK_RELEASE_KEY_ALIAS: deunlock
+        run: scripts/build-release-apk.sh
+      - name: Remove private signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/deunlock-release.jks"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: target/release-artifacts/*
+          if-no-files-found: error
+
+  assemble:
+    needs: [version, linux, android, install-smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: android
+          path: dist
+      - name: Assemble source, installer, metadata, and checksums
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          cp scripts/install.sh dist/install.sh
+          git archive --format=tar.gz --prefix="deunlock-$VERSION/" --output="dist/deunlock-$VERSION-source.tar.gz" HEAD
+          python3 scripts/release-metadata.py dist --version "$VERSION" --revision "$GITHUB_SHA"
+          (cd dist && sha256sum --check SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: [version, assemble]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist
+      - name: Publish the verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          (cd dist && sha256sum --check SHA256SUMS)
+          gh release create "$TAG" dist/* --verify-tag --title "deunlock $TAG" --notes-file deploy/release-notes.md --latest

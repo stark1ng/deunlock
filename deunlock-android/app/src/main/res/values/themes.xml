@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Roadmap item S-015 — minimal theme. Material light no-action-bar matches
+  prrr-android's pattern. Compose drives all real theming via MaterialTheme
+  in MainActivity; this XML theme only exists so the Application+Activity
+  attach correctly before setContent.
+-->
+<resources>
+    <style name="Theme.DeUnlockAndroid" parent="android:Theme.Material.Light.NoActionBar" />
+
+    <!--
+      Roadmap item S-014 — `ChallengeApprovalActivity` is rendered
+      over the keyguard as a transparent surface so the Compose tree
+      composites on top of whatever the user was last looking at.
+      `Theme.Translucent.NoTitleBar` is the AOSP-stable parent that
+      keeps the underlying screen visible.
+    -->
+    <style name="Theme.DeUnlockTranslucent" parent="android:Theme.Translucent.NoTitleBar" />
+</resources>

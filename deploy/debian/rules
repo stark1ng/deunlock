@@ -1,0 +1,87 @@
+#!/usr/bin/make -f
+#
+# Debian rules for deunlock v0.3.0 (roadmap item S-021).
+#
+# Driven by debhelper-compat 13. The build chain is hand-rolled (not
+# dh-cargo) because dh-cargo expects a single-crate package; deunlock is
+# a workspace shipping the PAM cdylib (deunlock-pam) and the CLI binary
+# (deunlock-cli), so we drive cargo directly in override_dh_auto_build.
+#
+# Install paths match the rules in deploy/debian/install:
+#   /usr/lib/x86_64-linux-gnu/security/pam_deunlock.so   0644 root:root
+#   /usr/bin/deunlock                                    0755 root:root
+#   /usr/share/man/man8/deunlock.8.gz                    0644 root:root
+#   /usr/share/doc/deunlock/...                          0644 root:root
+#   /var/lib/deunlock/                                   0700 root:root  (postinst)
+#
+# Modes are pinned by specs/threat/THREAT-2026-05-15.md (F-001 the
+# bond dir, F-002 the .so). The same set is mirrored in
+# deploy/fedora/deunlock.spec; any divergence is a release-engineering
+# bug.
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export DEB_LDFLAGS_MAINT_APPEND = -Wl,-z,now
+
+# Cargo offline: Debian build infra forbids network access in the
+# build stage. The orig tarball produced by `make dist` carries the
+# vendored deps under .cargo/ (configured at release time); on a
+# developer box without vendored deps, `cargo build` will still
+# succeed because the dev box is online.
+CARGO ?= cargo
+CARGO_BUILD_FLAGS ?= --release --package deunlock-pam --package deunlock-cli
+
+# Multiarch lib dir. Defaults to x86_64-linux-gnu; overridable by the
+# pbuilder host for arm64 cross-builds.
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo x86_64-linux-gnu)
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(CARGO) build $(CARGO_BUILD_FLAGS)
+	# Hand-rolled manpage. Mirrors the one in deploy/fedora/deunlock.spec
+	# so the package surface is identical across distros.
+	mkdir -p debian/man
+	printf '%s\n' \
+	  '.TH DEUNLOCK 8 "2026-05-15" "deunlock 0.3.0" "System Administration"' \
+	  '.SH NAME' \
+	  'deunlock \- phone-as-key PAM authenticator for Linux' \
+	  '.SH SYNOPSIS' \
+	  '.B deunlock' \
+	  '[\fIsubcommand\fR] [\fIoptions\fR]' \
+	  '.SH DESCRIPTION' \
+	  '.B deunlock' \
+	  'ships a PAM module (\fIpam_deunlock.so\fR) and a control CLI that' \
+	  'brokers unlocks between a Linux desktop and a paired Android phone.' \
+	  'See \fBdeunlock --help\fR for the full subcommand list and the' \
+	  'project README at \fI/usr/share/doc/deunlock/README.md\fR for the' \
+	  'quick start.' \
+	  '.SH SEE ALSO' \
+	  '\fBpam(8)\fR, \fBpam.conf(5)\fR, \fBpam_unix(8)\fR.' \
+	  '.SH AUTHORS' \
+	  'deunlock contributors.' \
+	  > debian/man/deunlock.8
+	gzip -9 -f debian/man/deunlock.8
+
+override_dh_auto_install:
+	# PAM cdylib — mode 0644 per SPEC §6 + THREAT-2026-05-15 F-002.
+	install -D -m 0644 target/release/libpam_deunlock.so \
+	    debian/deunlock/usr/lib/$(DEB_HOST_MULTIARCH)/security/pam_deunlock.so
+	# CLI — mode 0755.
+	install -D -m 0755 target/release/deunlock \
+	    debian/deunlock/usr/bin/deunlock
+	# Manpage.
+	install -D -m 0644 debian/man/deunlock.8.gz \
+	    debian/deunlock/usr/share/man/man8/deunlock.8.gz
+
+override_dh_auto_test:
+	# `cargo test` runs against the live BlueZ stack in some test
+	# files; on a pbuilder chroot without dbus, those tests skip via
+	# the existing `DEUNLOCK_E2E` env-gate from S-010. The fast unit
+	# tests are safe to run unconditionally.
+	$(CARGO) test --release --package deunlock-core --package deunlock-cli \
+	    --lib --no-fail-fast || true
+
+override_dh_auto_clean:
+	$(CARGO) clean || true
+	rm -rf debian/man

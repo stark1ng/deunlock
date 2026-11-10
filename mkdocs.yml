@@ -1,0 +1,70 @@
+site_name: deunlock
+site_url: https://mewplane.github.io/deunlock/
+site_description: Understand and operate phone-approved Linux authentication.
+docs_dir: docs
+site_dir: target/docs-site
+strict: true
+exclude_docs: |
+  /android-setup.md
+  /security.md
+  /known-gaps.md
+  /release-process.md
+  /perf-baselines.md
+  /bluetooth.md
+  /arch-update-check.md
+theme:
+  name: material
+  language: en
+  logo: assets/deunlock.png
+  favicon: assets/deunlock.png
+  font: false
+  palette:
+    scheme: deunlock
+  features:
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - toc.follow
+plugins:
+  - search
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+extra_css:
+  - stylesheets/deunlock.css
+extra_javascript:
+  - javascripts/mechanics.js
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Mewplane/deunlock
+      name: deunlock on GitHub
+nav:
+  - Start here: index.md
+  - Tutorial:
+      - Your first unlock: tutorials/first-unlock.md
+  - How-to:
+      - Install: how-to/install.md
+      - Pair and revoke: how-to/pair-and-revoke.md
+      - Troubleshoot: how-to/troubleshoot.md
+  - Reference:
+      - CLI: reference/cli.md
+      - Configuration: reference/configuration.md
+      - NixOS modules: reference/nix-modules.md
+      - Protocol: reference/protocol.md
+      - Glossary: reference/glossary.md
+  - Explanation:
+      - How it works: explanation/mechanics.md
+      - Security: explanation/security.md
+  - Contributing:
+      - Documentation: contributing/documentation.md
+      - Releases: contributing/releases.md

@@ -1,0 +1,15 @@
+DeUnlock
+========
+
+DeUnlock is a fork of syauth (https://github.com/Mewplane/syauth),
+Copyright (c) 2026 syauth contributors, licensed under the MIT License.
+
+Copyright (c) 2026 DeUnlock contributors.
+
+The original MIT license text is retained in the LICENSE file and applies
+to all code inherited from syauth. Modifications and new code introduced
+in this repository are released under the same MIT terms.
+
+Third-party components keep their own licenses; see Cargo.lock,
+deunlock-android/gradle/libs.versions.toml and the license headers in the
+individual source files.

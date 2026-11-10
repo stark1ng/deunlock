@@ -1,0 +1,74 @@
+name: documentation
+
+on:
+  push:
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements-docs.*'
+      - 'scripts/docs-*'
+      - '.github/workflows/docs.yml'
+      - 'scripts/install.sh'
+      - 'README.md'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements-docs.*'
+      - 'scripts/docs-*'
+      - '.github/workflows/docs.yml'
+      - 'scripts/install.sh'
+      - 'README.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+      - name: Install pinned documentation tools
+        run: python -m pip install -r requirements-docs.txt
+      - name: Install the pinned Chromium browser
+        run: python -m playwright install --with-deps chromium
+      - name: Build, check links, and exercise the documentation
+        run: python scripts/docs-check.py
+      - name: Upload the checked site
+        uses: actions/upload-artifact@v4
+        with:
+          name: deunlock-documentation
+          path: target/docs-site
+          if-no-files-found: error
+      - name: Include the shell installer in the published site
+        run: cp scripts/install.sh target/docs-site/install.sh
+      - name: Upload GitHub Pages site
+        if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/docs-site
+
+  deploy:
+    if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - name: Deploy checked documentation
+        id: deployment
+        uses: actions/deploy-pages@v4

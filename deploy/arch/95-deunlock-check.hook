@@ -1,0 +1,29 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = kscreenlocker
+Target = plasma-desktop
+Target = pam
+Target = pambase
+Target = glibc
+Target = sudo
+
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Path
+Target = etc/pam.d/*
+Target = usr/lib/pam.d/*
+Target = usr/lib/security/pam_deunlock.so
+Target = usr/lib/libgcc_s.so*
+Target = usr/lib/libaudit.so*
+Target = usr/lib/libcap-ng.so*
+
+[Action]
+Description = Checking deunlock PAM configuration and module dependencies...
+When = PostTransaction
+Exec = /usr/local/libexec/deunlock-update-check
+Depends = python

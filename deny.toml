@@ -1,0 +1,121 @@
+# cargo-deny configuration for deunlock.
+#
+# Roadmap item S-001 — license/advisory/ban policy. Mirrors the implicit policy
+# of the sibling `~/sources/prrr` workspace: a permissive allow-list aligned
+# with the OSS-first stance from AGENTS.md, plus deny on every advisory the
+# RustSec DB knows about. Adjusted via `cargo deny check` runs locally and in
+# CI on every push.
+#
+# Schema reference: https://embarkstudios.github.io/cargo-deny/checks/cfg.html
+
+[graph]
+# Target triples we ship to. Limits dep-graph analysis to platforms we actually
+# build for. Android targets are evaluated when the mobile crate gets enabled
+# in S-014.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "aarch64-linux-android" },
+    { triple = "armv7-linux-androideabi" },
+]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Advisories — RustSec database.
+# ---------------------------------------------------------------------------
+[advisories]
+version = 2
+# `db-path` and `db-urls` use defaults; the RustSec advisory DB on GitHub.
+yanked = "warn"
+# The compatible Secret Service release still uses zbus 5. These three
+# informational advisories describe its type crates merging into zbus 6;
+# they report no vulnerability. Track removal in BUG-20261018-2106 when
+# secret-service releases its zbus 6 migration (upstream PR #122).
+ignore = [
+    { id = "RUSTSEC-2026-0370", reason = "zvariant is required by secret-service 5; zbus 6 migration is unreleased" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names is required by secret-service 5; zbus 6 migration is unreleased" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive is required by secret-service 5; zbus 6 migration is unreleased" },
+    { id = "RUSTSEC-2026-0374", reason = "Build-only Askama configuration parser, still required by current UniFFI; no patched release exists. Track replacement in BUG-20261031-1221." },
+]
+
+# ---------------------------------------------------------------------------
+# Licenses.
+# ---------------------------------------------------------------------------
+#
+# Allow-list calibrated to common Rust OSS licenses. Anything outside this set
+# requires an explicit exception (added here with rationale).
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+exceptions = []
+
+# `clarify` and `private` entries are deliberately empty for v0.1; we have no
+# vendored or private deps that need re-licensing yet.
+
+# ---------------------------------------------------------------------------
+# Bans — crate-graph hygiene.
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+# Acknowledged duplicate versions. Each is pulled transitively by a
+# dependency we do not control and cannot be unified with the version
+# our own crates select. The multiple-versions check stays active for
+# every crate NOT listed here, so a duplicate we *can* fix still warns.
+#
+#   * Old RustCrypto generation (block-buffer 0.10, cpufeatures 0.2,
+#     crypto-common 0.1, digest 0.10, hkdf 0.12, hmac 0.12, sha2 0.10):
+#     pulled by `secret-service`/`aes` and the `*-dalek` crates. Our
+#     own crates are already on the new generation (digest 0.11, sha2
+#     0.11, hmac 0.13, hkdf 0.13).
+#   * getrandom 0.2 / 0.4: transitive; our crates use getrandom 0.3.
+#   * toml 0.5 and the `zbus`/`proc-macro-crate` toml stack
+#     (toml_edit 0.25, toml_datetime 1.1, winnow 1.0): we depend on
+#     toml 0.8, which pins toml_edit 0.22 / toml_datetime 0.6 /
+#     winnow 0.7.
+# syn 2 remains required by serde/UniFFI while async-trait needs syn 3.
+skip = [
+    { crate = "block-buffer@0.10.4" },
+    { crate = "cpufeatures@0.2.17" },
+    { crate = "crypto-common@0.1.7" },
+    { crate = "digest@0.10.7" },
+    { crate = "getrandom@0.2.17" },
+    { crate = "getrandom@0.4.2" },
+    { crate = "hkdf@0.12.4" },
+    { crate = "hmac@0.12.1" },
+    { crate = "sha2@0.10.9" },
+    { crate = "syn@2.0.117" },
+    { crate = "toml@0.5.11" },
+    { crate = "toml_datetime@1.1.1+spec-1.1.0" },
+    { crate = "toml_edit@0.25.11+spec-1.1.0" },
+    { crate = "winnow@1.0.3" },
+]
+skip-tree = []
+
+# ---------------------------------------------------------------------------
+# Sources — where crates may be fetched from.
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

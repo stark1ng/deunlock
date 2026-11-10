@@ -1,0 +1,94 @@
+# deunlock-transport — BtPeer trait + BlueZ central + LAN fallback.
+#
+# Roadmap items S-007, S-010. S-007 lands the async `BtPeer` / `Session` trait
+# pair plus a `tokio::sync::mpsc`-backed `MockBtPeer` so the PAM module
+# (S-008/S-009) can be tested end-to-end before any real radio code exists.
+# S-010 will add `bluer`-backed `BlueZBtPeer` behind the same trait.
+
+[package]
+name = "deunlock-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "deunlock transport layer (BLE GATT central via bluer + mock)"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[features]
+# Default feature set. The `test-fake` feature is included by default
+# so the roadmap closure-condition probe
+# `cargo test -p deunlock-transport --test peripheral_contract` works
+# verbatim. Production consumers (`deunlock-pam`, `deunlock-presenced`)
+# declare the dep with `default-features = false` so the fake never
+# lands in the shipped binary; this keeps the AGENTS.md
+# "production code paths don't pay the cost" non-negotiable.
+default = ["test-fake"]
+
+# S-003: gate the `FakePeripheral` test double so production consumers
+# opt out via `default-features = false`. Downstream daemon tests
+# (S-004 onwards) enable it explicitly with
+# `deunlock-transport = { default-features = false, features = ["test-fake"] }`.
+test-fake = []
+
+[dependencies]
+# Shared protocol core. `Frame` and `FrameError` are the only types that cross
+# the `BtPeer` trait boundary, so consumers can swap implementations (mock
+# today, `bluer` in S-010) without touching the upper layers.
+deunlock-core = { version = "0.3", path = "../deunlock-core" }
+
+# Async trait surface. `BtPeer` and `Session` are `async fn` methods on trait
+# objects; `async-trait` is the canonical way to do that on stable Rust.
+async-trait = "0.1.92"
+
+# Typed errors with `Display` impls. Matches the version pinned by
+# `deunlock-core` so the workspace stays on a single major.
+thiserror = "2"
+
+# Tokio runtime primitives. `sync` for `mpsc`, `time` for `tokio::time::sleep`
+# / `tokio::time::timeout`, plus `macros` / `rt` / `rt-multi-thread` so the
+# `#[tokio::test]` attribute compiles inside the mock's test module.
+tokio = { version = "1", features = ["sync", "macros", "time", "rt", "rt-multi-thread"] }
+
+# `BlueZBtPeer::connect` consumes async streams from bluer (Adapter
+# discovery, Characteristic notifications). `futures` provides the
+# `StreamExt::next` adapter we need to await one event with timeout.
+futures = "0.3"
+
+# `Uuid::from_u128` so the deunlock GATT UUIDs can be defined as
+# compile-time constants matching the Kotlin
+# `UUID.fromString(...)` constants on the phone side.
+uuid = "1"
+
+# Official BlueZ Rust binding (S-010). `bluetoothd` is the feature that enables
+# the high-level DBus surface — adapter / device / GATT — which is exactly the
+# surface `BlueZBtPeer` consumes. Pinned to the `0.17` major; minor revs flow
+# via Cargo.lock. `default-features = false` keeps the closure small so the
+# `id` / `mesh` / `l2cap` / `rfcomm` / `serde` features (none of which we use
+# in v0.1) do not pull extra deps. See JOURNEY-S-010 §5 for rationale.
+bluer = { version = "0.17", default-features = false, features = ["bluetoothd"] }
+
+# HKDF-SHA256 for the rotating session UUID derivation. The bond key is
+# already 32 high-entropy bytes, so HKDF salt = None is documented in
+# JOURNEY-S-010 §1. `hkdf` 0.13 / `sha2` 0.11 are the current
+# RustCrypto-ecosystem versions and pair together.
+hkdf = "0.13"
+sha2 = "0.11"
+
+# Diagnostic logging for GATT registration + control-loop events.
+tracing = "0.1"
+
+# 32 random bytes for the host pubkey served on the pair characteristic.
+# Already in the workspace via `deunlock-presenced` and `deunlock-pam`;
+# pinned to the same major (0.3) so cargo resolves a single copy.
+getrandom = "0.3"
+
+[dev-dependencies]
+# Full feature set for tests so we can use `#[tokio::test(flavor = ...)]`,
+# `tokio::time::pause`, etc., should we ever need them.
+tokio = { version = "1", features = ["full"] }
+

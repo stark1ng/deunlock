@@ -1,0 +1,13 @@
+# PAM service fixture for the deunlock e2e smoke test.
+#
+# DO NOT INSTALL TO /etc/pam.d. The `tests/pam_smoke.rs` harness OVERWRITES
+# the `auth required` line below at runtime so the path to libpam_deunlock.so
+# is the absolute path resolved from `CARGO_MANIFEST_DIR`. The placeholder
+# tag `__DEUNLOCK_SO_PATH__` below is what the harness substitutes.
+#
+# When pamtester drives this file with `--confdir <repo>/tests/pam.d
+# deunlock-test`, the loader resolves the absolute `.so` from this file alone.
+#
+# Journey: specs/journeys/JOURNEY-S-008-pam-skeleton.md
+auth     required    __DEUNLOCK_SO_PATH__
+account  required    __DEUNLOCK_SO_PATH__

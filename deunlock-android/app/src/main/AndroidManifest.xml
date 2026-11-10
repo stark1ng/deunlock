@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Roadmap items S-016 (BLE pairing), S-017 (BiometricPrompt), and
+  S-018 (CompanionDeviceService background bridge) — manifest carries
+  the runtime permissions the pairing screen, the Approve screen, and
+  the background bridge need.
+
+  Permission contract (audited in
+  specs/journeys/JOURNEY-S-016-android-pairing.md "Bluetooth Permission
+  Contract", specs/journeys/JOURNEY-S-017-android-approve.md, and
+  specs/journeys/JOURNEY-S-018-android-background-bridge.md):
+
+    - BLUETOOTH_CONNECT  — connect to the desktop's GATT server +
+                           initiate LESC bonding (S-016 Phase 3).
+                           Runtime permission on API 31+.
+    - USE_BIOMETRIC      — gates the Keystore-backed signing key on a
+                           fresh user gesture via BiometricPrompt
+                           (S-017 Approve screen).
+    - REQUEST_COMPANION_RUN_IN_BACKGROUND — keeps the
+                           CompanionDeviceService binding alive while
+                           the bonded peer is in range (S-018) AND
+                           authorises the DEV-001 CDM pivot's
+                           `CompanionDeviceManager.associate` call
+                           that replaces the unprivileged
+                           BluetoothLeScanner path.
+    - POST_NOTIFICATIONS — runtime permission on API 33+ for the
+                           approve heads-up notification (S-018).
+    - FOREGROUND_SERVICE — the CompanionDeviceService runs in the
+                           foreground while bound (S-018). The OS
+                           does the elevation; we only need the
+                           manifest declaration.
+    - FOREGROUND_SERVICE_CONNECTED_DEVICE — Android 14 sub-type
+                           required when a foreground service exists
+                           because of a bonded device (S-018).
+
+  DEV-003 removed the legacy advertise permission. The DEV-001 CDM
+  pivot (2026-05-17) removed `BLUETOOTH_SCAN` because Samsung One UI
+  on the Galaxy S25 Ultra requires `BLUETOOTH_PRIVILEGED` for
+  unprivileged scanners; `CompanionDeviceManager.associate` carries a
+  `BluetoothLeDeviceFilter(serviceUuid=...)` and runs the scan under
+  system privileges, so the app no longer needs the scan permission.
+  ACCESS_FINE_LOCATION (the legacy companion of BLUETOOTH_SCAN on
+  API 26-30) follows the same removal logic.
+
+  Explicitly NOT declared (still owned by future roadmap items):
+    - INTERNET             — never (BLE-only protocol per SPEC §3.4).
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- BLE connect + LESC bond: S-016 Phase 3. -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_CONNECT"
+        tools:targetApi="31" />
+
+    <!--
+      S-012: required for `BootCompletedReceiver` to receive
+      `Intent.ACTION_BOOT_COMPLETED`. Without this permission the OS
+      silently drops the broadcast and the receiver never runs,
+      defeating the boot-resurrection trigger.
+    -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!--
+      S-017: BiometricPrompt gate for the Keystore-backed signing key.
+      Required by androidx.biometric:biometric 1.2.0-alpha05.
+    -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+
+    <!--
+      S-014: `DeUnlockCompanionService` launches `ChallengeApprovalActivity`
+      via `PendingIntent.getActivity` on every fresh challenge frame.
+      Required for `android:showWhenLocked` + `android:turnScreenOn` to
+      wake the screen and render over the keyguard on Android 14+.
+    -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+
+    <!--
+      S-018: CompanionDeviceService background bridge. The four
+      permissions below are mandatory for the OS to bind our
+      `DeUnlockCompanionService` when the bonded peer comes into BLE
+      range. See `bg/DeUnlockCompanionService.kt`.
+    -->
+    <uses-permission android:name="android.permission.REQUEST_COMPANION_RUN_IN_BACKGROUND" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"
+        tools:targetApi="34" />
+    <!--
+      DEV-001 follow-up: without `REQUEST_OBSERVE_COMPANION_DEVICE_PRESENCE`
+      the OS refuses `CompanionDeviceManager.startObservingDevicePresence`
+      and the bonded peer's association sits with
+      `mNotifyOnDeviceNearby=false` — meaning `DeUnlockCompanionService`
+      never gets bound when the desktop's rotating unlock UUID appears
+      in range. The PAM module then sees `response-timeout` on every
+      unlock. The grant is silent (no runtime dialog); the manifest
+      declaration is sufficient.
+    -->
+    <uses-permission
+        android:name="android.permission.REQUEST_OBSERVE_COMPANION_DEVICE_PRESENCE"
+        tools:targetApi="31" />
+
+    <!--
+      Declared so `CompanionDeviceManager.associate(...)` is dispatchable —
+      Android's CDM service refuses the call otherwise (verified on
+      Galaxy S25 Ultra, One UI / Android 15: `IllegalStateException: Must
+      declare uses-feature android.software.companion_device_setup in
+      manifest to use this API`). Anchors the DEV-001 CDM pivot.
+    -->
+    <uses-feature
+        android:name="android.software.companion_device_setup"
+        android:required="true" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.DeUnlockAndroid"
+        tools:targetApi="31">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.DeUnlockAndroid">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!--
+              S-018: deep-link from the approve notification's
+              PendingIntent. The action is `ACTION_VIEW` and the data
+              scheme is `deunlock://approve/<peerId>`; MainActivity
+              parses the extras and navigates to the approve route.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="deunlock" android:host="approve" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          S-011: long-running foreground `Service` (no longer a
+          `CompanionDeviceService` subclass). `MainActivity` starts
+          it explicitly via `startForegroundService` whenever a
+          bond record exists; the service then holds one
+          `PersistentGattClient` per bonded peer at idle. The
+          `connectedDevice` foreground type satisfies Android 14+'s
+          type-enforcement check at `startForeground` time. The
+          CDM-style intent-filter from S-018 is gone — the OS no
+          longer binds the service via the CompanionDeviceService
+          path.
+        -->
+        <service
+            android:name=".bg.DeUnlockCompanionService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice"
+            tools:targetApi="31" />
+
+        <!--
+          S-014: `ChallengeApprovalActivity` — transparent, no-history,
+          single-instance activity launched by `DeUnlockCompanionService`
+          via `PendingIntent.getActivity` on every fresh challenge frame.
+          `android:showWhenLocked="true"` + `android:turnScreenOn="true"`
+          wake the screen and render the prompt over the keyguard.
+          `exported="false"` blocks third-party launch — only this
+          package's own service can fire the intent.
+        -->
+        <activity
+            android:name=".bg.ChallengeApprovalActivity"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:noHistory="true"
+            android:showOnLockScreen="true"
+            android:turnScreenOn="true"
+            android:theme="@style/Theme.DeUnlockTranslucent"
+            android:configChanges="orientation|screenSize"
+            tools:targetApi="27" />
+
+        <!--
+          S-012: `BOOT_COMPLETED` resurrection trigger. Fires once per
+          phone boot; the receiver consults the on-disk bond and (when
+          present) issues `startForegroundService` so
+          `DeUnlockCompanionService` is back up before the user's next
+          `sudo` on the desktop. `exported="true"` is required —
+          `BOOT_COMPLETED` is a protected broadcast sent by the system,
+          and a `false` export would block the dispatch.
+        -->
+        <receiver
+            android:name=".bg.BootCompletedReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

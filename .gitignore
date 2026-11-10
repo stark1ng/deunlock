@@ -1,0 +1,16 @@
+/target
+/crates/deunlock-mobile/target
+/crates/deunlock-mobile/bindings
+/deunlock-android/.gradle
+/deunlock-android/app/build
+/deunlock-android/build
+/deunlock-android/local.properties
+/.claude/worktrees
+*.iml
+.DS_Store
+__pycache__/
+*.pyc
+.direnv/
+.pre-commit-config.yaml
+result
+result-*
