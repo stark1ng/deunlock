@@ -42,7 +42,7 @@ use std::{
 };
 
 use nix::unistd::{Gid, Uid, fchown};
-use deunlock_core::{Bond, BondError, BondStatus, BondStore, NONCE_LEN};
+use deunlock_core::{Bond, BondError, BondStatus, BondStore, NONCE_LEN, SIGNATURE_LEN};
 use deunlock_presenced::{
     OUTCOME_REASON_BAD_SIGNATURE, OUTCOME_REASON_BUSY, OUTCOME_REASON_DENIED, OUTCOME_REASON_OK, OUTCOME_REASON_REPLAY, OUTCOME_REASON_USER_DECLINED,
     OUTCOME_REASON_RESPONSE_TIMEOUT, OUTCOME_REASON_TRANSPORT_ERROR, OUTCOME_REASON_UNKNOWN_PEER, Request, Response, read_frame_blocking,
@@ -90,6 +90,20 @@ pub const DAEMON_FAST_FAIL_SLACK: Duration = Duration::from_millis(50);
 /// over the wire. The SPEC §6 Failure Taxonomy maps this to
 /// `PAM_AUTHINFO_UNAVAIL` so the stack falls through to FIDO.
 pub const OUTCOME_REASON_OFFLINE: &str = "offline";
+
+/// Reason recorded when the daemon's answer does not echo the request we sent
+/// (wrong `peer_id` or wrong nonce).
+///
+/// A trusted daemon should never produce this, which is exactly why it fails
+/// closed as `PAM_AUTH_ERR`: a crossed or stale socket reply must never be
+/// mapped onto a successful login (AUDIT-001 D-04).
+pub const OUTCOME_REASON_REQUEST_MISMATCH: &str = "request-mismatch";
+
+/// Reason the daemon reports when the request nonce is not 16 bytes.
+///
+/// Mirrors `deunlock_presenced::server::REASON_BAD_REQUEST_NONCE`; kept as a
+/// literal here because the daemon's `server` module is private.
+pub const OUTCOME_REASON_BAD_REQUEST_NONCE: &str = "bad-request-nonce";
 
 /// Reason emitted by the PAM module when the daemon reports the
 /// BlueZ adapter is missing. SPEC §6 Failure Taxonomy row "BlueZ
@@ -265,11 +279,18 @@ fn authenticate_inner(cfg: &Config) -> AuthOutcome {
 
     // -- step 2: fresh nonce for the wire frame ------------------------
     let mut nonce = [0u8; NONCE_LEN];
-    if getrandom_fill(&mut nonce).is_err() {
-        return AuthOutcome::AuthInfoUnavail {
-            reason: OUTCOME_REASON_TRANSPORT_ERROR,
-            peer_id: Some(peer_id),
-        };
+    match cfg.test_fixed_nonce {
+        // Test-only path: the harness daemon runs with `--test-fixed-nonce`
+        // and the canned signature covers that value.
+        Some(fixed) => nonce = fixed,
+        None => {
+            if getrandom_fill(&mut nonce).is_err() {
+                return AuthOutcome::AuthInfoUnavail {
+                    reason: OUTCOME_REASON_TRANSPORT_ERROR,
+                    peer_id: Some(peer_id),
+                };
+            }
+        }
     }
 
     // -- step 3: daemon round-trip --------------------------------------
@@ -289,9 +310,38 @@ fn authenticate_inner(cfg: &Config) -> AuthOutcome {
         }
     };
 
-    // -- step 4: map response.reason to PAM code -----------------------
+    // -- step 4: validate the echo, then map the reason to a PAM code ----
     match response {
-        Response::Challenge { reason, .. } => {
+        Response::Challenge {
+            ok,
+            signature,
+            reason,
+            peer_id: echoed_peer,
+            nonce: echoed_nonce,
+        } => {
+            // The daemon is inside the trusted boundary, but the *answer* must
+            // still be provably the answer to *our* question. A stale,
+            // duplicated or crossed socket reply is a bug or an attack, and
+            // either way must not become PAM_SUCCESS (AUDIT-001 D-04).
+            if echoed_peer != peer_id || echoed_nonce.as_slice() != nonce.as_slice() {
+                return AuthOutcome::AuthErr {
+                    reason: OUTCOME_REASON_REQUEST_MISMATCH,
+                    peer_id: Some(peer_id),
+                };
+            }
+
+            // `reason == "ok"` has to be backed by `ok == true` and a real
+            // 64-byte signature. The daemon's own verification already ran;
+            // this check exists so an inconsistent triple is treated as an
+            // attack rather than trusted because the string looked right.
+            let has_signature = signature.as_ref().is_some_and(|sig| sig.len() == SIGNATURE_LEN);
+            if (reason == OUTCOME_REASON_OK && (!ok || !has_signature)) || (reason != OUTCOME_REASON_OK && ok) {
+                return AuthOutcome::AuthErr {
+                    reason: OUTCOME_REASON_BAD_SIGNATURE,
+                    peer_id: Some(peer_id),
+                };
+            }
+
             let (code, static_reason) = outcome_reason_to_pam(&reason);
             if code == PAM_SUCCESS {
                 AuthOutcome::Success { peer_id }
@@ -498,6 +548,22 @@ mod tests {
 
     impl MockDaemonHandle {
         fn new(socket_path: PathBuf, canned_reason: &'static str, ok: bool, include_signature: bool) -> Self {
+            Self::spawn(socket_path, canned_reason, ok, include_signature, false)
+        }
+
+        /// Like [`Self::new`], but the canned answer echoes a wrong nonce, so
+        /// the PAM module's echo check has something to reject.
+        fn new_echo_mismatch(socket_path: PathBuf, canned_reason: &'static str, ok: bool, include_signature: bool) -> Self {
+            Self::spawn(socket_path, canned_reason, ok, include_signature, true)
+        }
+
+        fn spawn(
+            socket_path: PathBuf,
+            canned_reason: &'static str,
+            ok: bool,
+            include_signature: bool,
+            corrupt_echo: bool,
+        ) -> Self {
             let listener = UnixListener::bind(&socket_path).expect("bind mock daemon listener");
             listener.set_nonblocking(false).expect("set blocking");
             let (tx, _rx) = stdmpsc::channel::<()>();
@@ -507,12 +573,20 @@ mod tests {
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                     if let Ok(req) = deunlock_presenced::read_frame_blocking::<_, Request>(&mut stream) {
-                        let _ = req;
+                        let (echoed_peer, echoed_nonce) = match req {
+                            Request::Challenge { peer_id, nonce } => {
+                                let echoed = if corrupt_echo { vec![0xFFu8; nonce.len()] } else { nonce };
+                                (peer_id, echoed)
+                            }
+                            _ => (String::new(), Vec::new()),
+                        };
                         let signature = if include_signature { Some(vec![0xAA; SIGNATURE_LEN]) } else { None };
                         let resp = Response::Challenge {
                             ok,
                             signature,
                             reason: canned_reason.to_owned(),
+                            peer_id: echoed_peer,
+                            nonce: echoed_nonce,
                         };
                         let _ = deunlock_presenced::write_frame_blocking(&mut stream, &resp);
                         // Brief read to flush write before close.
@@ -644,6 +718,50 @@ mod tests {
             other => panic!("expected Success, got {other:?}"),
         }
         assert_eq!(outcome.to_pam_code(), PAM_SUCCESS);
+    }
+
+    /// AUDIT-001 D-04: an answer that does not echo *our* nonce must fail
+    /// closed, even when the reason string says `ok`.
+    #[test]
+    fn authenticate_rejects_echoed_nonce_mismatch() {
+        let tmp = make_tempdir_0o700();
+        let (cfg, _peer_id) = config_with_one_bonded(&tmp);
+        let _daemon = MockDaemonHandle::new_echo_mismatch(cfg.socket_path.clone(), OUTCOME_REASON_OK, true, true);
+        let outcome = authenticate(&cfg);
+        match &outcome {
+            AuthOutcome::AuthErr { reason, .. } => assert_eq!(*reason, OUTCOME_REASON_REQUEST_MISMATCH),
+            other => panic!("expected AuthErr(request-mismatch), got {other:?}"),
+        }
+        assert_eq!(outcome.to_pam_code(), PAM_AUTH_ERR);
+    }
+
+    /// AUDIT-001 D-04: `reason = "ok"` without a signature is an inconsistent
+    /// triple, not a success.
+    #[test]
+    fn authenticate_rejects_ok_reason_without_signature() {
+        let tmp = make_tempdir_0o700();
+        let (cfg, _peer_id) = config_with_one_bonded(&tmp);
+        let _daemon = MockDaemonHandle::new(cfg.socket_path.clone(), OUTCOME_REASON_OK, true, false);
+        let outcome = authenticate(&cfg);
+        match &outcome {
+            AuthOutcome::AuthErr { reason, .. } => assert_eq!(*reason, OUTCOME_REASON_BAD_SIGNATURE),
+            other => panic!("expected AuthErr(bad-signature), got {other:?}"),
+        }
+        assert_eq!(outcome.to_pam_code(), PAM_AUTH_ERR);
+    }
+
+    /// AUDIT-001 D-04: `ok = true` with a non-success reason is equally
+    /// inconsistent.
+    #[test]
+    fn authenticate_rejects_ok_flag_with_failure_reason() {
+        let tmp = make_tempdir_0o700();
+        let (cfg, _peer_id) = config_with_one_bonded(&tmp);
+        let _daemon = MockDaemonHandle::new(cfg.socket_path.clone(), OUTCOME_REASON_BUSY, true, true);
+        let outcome = authenticate(&cfg);
+        match &outcome {
+            AuthOutcome::AuthErr { reason, .. } => assert_eq!(*reason, OUTCOME_REASON_BAD_SIGNATURE),
+            other => panic!("expected AuthErr(bad-signature), got {other:?}"),
+        }
     }
 
     /// TC-03: mock daemon replies `busy` → `PAM_AUTHINFO_UNAVAIL`.

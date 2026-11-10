@@ -245,7 +245,12 @@ fn end_to_end_against_real_daemon_binary() {
     let _daemon = DaemonProcess::spawn(args);
     wait_for_socket(&socket_path);
 
-    let cfg = Config::for_tests(tmp.path()).with_socket_path(socket_path.clone());
+    // The daemon runs with `--test-fixed-nonce`, so PAM must ask its question
+    // with that same nonce: the echo check refuses an answer to a different
+    // question by design (AUDIT-001 D-04).
+    let cfg = Config::for_tests(tmp.path())
+        .with_socket_path(socket_path.clone())
+        .with_test_fixed_nonce(TEST_FIXED_NONCE);
     let outcome = auth::authenticate(&cfg);
 
     match &outcome {

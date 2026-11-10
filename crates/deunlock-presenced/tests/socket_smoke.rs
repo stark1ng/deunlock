@@ -157,7 +157,9 @@ async fn challenge_request_returns_stub() {
         .expect("decode succeeds");
 
     match response {
-        Response::Challenge { ok, signature, reason } => {
+        Response::Challenge { ok, signature, reason, peer_id: echoed_peer, nonce: echoed_nonce } => {
+            assert!(!echoed_peer.is_empty(), "echo must carry the peer id");
+            assert_eq!(echoed_nonce.len(), 16, "echo must carry the request nonce");
             assert!(!ok, "stub response must have ok=false");
             assert!(signature.is_none(), "stub response must have no signature");
             assert_eq!(reason, STUB_CHALLENGE_REASON, "stub reason must match SPEC");

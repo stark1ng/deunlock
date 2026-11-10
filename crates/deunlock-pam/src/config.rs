@@ -23,6 +23,8 @@ use std::{
     time::Duration,
 };
 
+use deunlock_core::NONCE_LEN;
+
 /// Default directory for `bonds.toml` and `last.log`. Mirrors SPEC §4.4.
 ///
 /// Tests override this via [`Config::with_bond_dir`] so they never touch the
@@ -79,6 +81,14 @@ pub struct Config {
     /// Daemon round-trip budget. Caps the time PAM spends waiting for
     /// the daemon to write back `Response::Challenge`. SPEC §4.3.
     pub auth_timeout: Duration,
+    /// Test-only fixed challenge nonce.
+    ///
+    /// Production code always leaves this `None` and draws a fresh nonce from
+    /// the OS CSPRNG. The end-to-end harness uses it to drive a daemon started
+    /// with `--test-fixed-nonce`, where the phone's canned signature covers a
+    /// known value. It is never reachable from libpam `argv`, so a PAM stack
+    /// cannot pin a nonce by configuration.
+    pub test_fixed_nonce: Option<[u8; NONCE_LEN]>,
 }
 
 impl Default for Config {
@@ -87,6 +97,7 @@ impl Default for Config {
             bond_dir: PathBuf::from(DEFAULT_BOND_DIR),
             socket_path: Self::resolve_socket_path(None),
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
+            test_fixed_nonce: None,
         }
     }
 }
@@ -107,6 +118,7 @@ impl Config {
             bond_dir: PathBuf::from(DEFAULT_BOND_DIR),
             socket_path: Self::resolve_socket_path(socket_override),
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
+            test_fixed_nonce: None,
         }
     }
 
@@ -143,6 +155,7 @@ impl Config {
             bond_dir: bond_dir.to_path_buf(),
             socket_path: bond_dir.join(DEFAULT_SOCKET_BASENAME),
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
+            test_fixed_nonce: None,
         }
     }
 
@@ -157,6 +170,15 @@ impl Config {
     #[must_use]
     pub fn with_socket_path(mut self, socket_path: PathBuf) -> Self {
         self.socket_path = socket_path;
+        self
+    }
+
+    /// Builder: pin the challenge nonce for the end-to-end harness.
+    ///
+    /// Test-only; see [`Config::test_fixed_nonce`].
+    #[must_use]
+    pub fn with_test_fixed_nonce(mut self, nonce: [u8; NONCE_LEN]) -> Self {
+        self.test_fixed_nonce = Some(nonce);
         self
     }
 

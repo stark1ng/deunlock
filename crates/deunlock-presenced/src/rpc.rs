@@ -84,6 +84,19 @@ pub enum Response {
         /// `"offline"`, `"denied"`, `"replay"`, etc. Keeps the PAM
         /// module's error mapping table greppable.
         reason: String,
+        /// Echo of the request's `peer_id`.
+        ///
+        /// The PAM module refuses an answer whose echo does not match the
+        /// question it asked, so a stale or crossed socket reply can never be
+        /// mapped to `PAM_SUCCESS` (AUDIT-001 D-04).
+        peer_id: String,
+        /// Echo of the nonce the challenge was actually issued for.
+        ///
+        /// This is the caller's nonce unless the daemon overrode it (test
+        /// harness only); either way it is the value the phone signed, and the
+        /// PAM module compares it byte-for-byte with the one it sent.
+        #[serde(with = "serde_bytes")]
+        nonce: Vec<u8>,
     },
     /// Outcome of `Request::Reload`. S-002 always emits `ok=true`;
     /// S-005 fills in failure paths.
@@ -365,6 +378,8 @@ mod tests {
             ok: false,
             signature: None,
             reason: "not-implemented".to_string(),
+            peer_id: "test-peer".to_string(),
+            nonce: TEST_NONCE.to_vec(),
         };
         assert_eq!(round_trip_response(&original), original);
     }
@@ -375,8 +390,32 @@ mod tests {
             ok: true,
             signature: Some(vec![0xaa; 64]),
             reason: "ok".to_string(),
+            peer_id: "test-peer".to_string(),
+            nonce: TEST_NONCE.to_vec(),
         };
         assert_eq!(round_trip_response(&original), original);
+    }
+
+    #[test]
+    fn response_challenge_echo_survives_the_wire() {
+        // The echo fields are what the PAM module compares against its own
+        // request, so they must survive CBOR byte-for-byte (AUDIT-001 D-04).
+        let nonce = [0x7Fu8; 16];
+        let original = Response::Challenge {
+            ok: true,
+            signature: Some(vec![0x11; 64]),
+            reason: "ok".to_string(),
+            peer_id: "peer-echo".to_string(),
+            nonce: nonce.to_vec(),
+        };
+        let decoded = round_trip_response(&original);
+        match decoded {
+            Response::Challenge { peer_id, nonce: echoed, .. } => {
+                assert_eq!(peer_id, "peer-echo");
+                assert_eq!(echoed, nonce.to_vec());
+            }
+            other => panic!("expected Challenge, got {other:?}"),
+        }
     }
 
     #[test]

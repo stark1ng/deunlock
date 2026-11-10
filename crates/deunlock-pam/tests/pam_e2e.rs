@@ -68,12 +68,18 @@ impl MockDaemon {
             if let Ok((mut stream, _addr)) = listener.accept() {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-                if let Ok(_req) = read_frame_blocking::<_, Request>(&mut stream) {
+                if let Ok(req) = read_frame_blocking::<_, Request>(&mut stream) {
+                    let (echo_peer, echo_nonce) = match &req {
+                        Request::Challenge { peer_id, nonce } => (peer_id.clone(), nonce.clone()),
+                        _ => (String::new(), Vec::new()),
+                    };
                     let signature = if include_signature { Some(vec![0xAA; SIGNATURE_LEN]) } else { None };
                     let resp = Response::Challenge {
                         ok,
                         signature,
                         reason: reason.to_owned(),
+                        peer_id: echo_peer,
+                        nonce: echo_nonce,
                     };
                     let _ = write_frame_blocking(&mut stream, &resp);
                     let mut buf = [0u8; 1];

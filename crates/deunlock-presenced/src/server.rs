@@ -54,6 +54,13 @@ pub const CONCURRENT_ACCEPT_CAP: usize = 4;
 /// S-006 + S-007.
 pub const STUB_CHALLENGE_REASON: &str = "not-implemented";
 
+/// Reason emitted when the PAM caller's request nonce is not exactly
+/// [`NONCE_BYTES`] long.
+///
+/// A malformed request is a client bug or a desynchronised socket, never a
+/// legitimate state, so PAM maps it to `PAM_AUTH_ERR` and fails closed.
+pub const REASON_BAD_REQUEST_NONCE: &str = "bad-request-nonce";
+
 /// Root UID (uid 0) — accepted by the SO_PEERCRED check because PAM
 /// modules run as root in sudo's auth phase.
 const UID_ROOT: u32 = 0;
@@ -336,26 +343,47 @@ async fn dispatch(
     started_at: SystemTime,
 ) -> Response {
     match request {
-        Request::Challenge { peer_id, .. } => match orchestrator {
-            Some(o) => {
-                let outcome = match test_fixed_nonce {
-                    Some(nonce) => o.issue_challenge_with_nonce(peer_id, nonce, DEFAULT_AUTH_TIMEOUT).await,
-                    None => o.issue_challenge(peer_id, DEFAULT_AUTH_TIMEOUT).await,
-                };
-                let signature = outcome.signature_bytes();
-                let ok = matches!(outcome, crate::orchestrator::ChallengeOutcome::Ok { .. });
-                Response::Challenge {
-                    ok,
-                    signature,
-                    reason: outcome.reason_str().to_string(),
+        Request::Challenge { peer_id, nonce } => {
+            let requested = match <[u8; NONCE_BYTES]>::try_from(nonce.as_slice()) {
+                Ok(n) => n,
+                Err(_) => {
+                    return Response::Challenge {
+                        ok: false,
+                        signature: None,
+                        reason: REASON_BAD_REQUEST_NONCE.to_string(),
+                        peer_id: peer_id.clone(),
+                        nonce: nonce.clone(),
+                    };
                 }
+            };
+            match orchestrator {
+                Some(o) => {
+                    // The caller's nonce *is* the challenge nonce: the phone
+                    // must sign the value PAM chose, so PAM can prove the
+                    // answer belongs to its own question (AUDIT-001 D-04).
+                    // `test_fixed_nonce` overrides it for the deterministic
+                    // harness, and the echo reports whichever value was used.
+                    let used_nonce = test_fixed_nonce.unwrap_or(requested);
+                    let outcome = o.issue_challenge_with_nonce(peer_id, used_nonce, DEFAULT_AUTH_TIMEOUT).await;
+                    let signature = outcome.signature_bytes();
+                    let ok = matches!(outcome, crate::orchestrator::ChallengeOutcome::Ok { .. });
+                    Response::Challenge {
+                        ok,
+                        signature,
+                        reason: outcome.reason_str().to_string(),
+                        peer_id: peer_id.clone(),
+                        nonce: used_nonce.to_vec(),
+                    }
+                }
+                None => Response::Challenge {
+                    ok: false,
+                    signature: None,
+                    reason: STUB_CHALLENGE_REASON.to_string(),
+                    peer_id: peer_id.clone(),
+                    nonce: requested.to_vec(),
+                },
             }
-            None => Response::Challenge {
-                ok: false,
-                signature: None,
-                reason: STUB_CHALLENGE_REASON.to_string(),
-            },
-        },
+        }
         Request::Reload => match reload_tx {
             Some(tx) => match tx
                 .send(ReloadCommand {

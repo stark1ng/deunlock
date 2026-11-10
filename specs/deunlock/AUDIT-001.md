@@ -151,11 +151,17 @@ MITM при пейринге. Для Wi-Fi-транспорта QR даёт ст
 | D-01 | ядро готово, проводка — P2 | `kex.rs`: ECDH P-256, `bond_key` из shared secret с привязкой к host_id/phone_id/nonce, key separation для MAC-ключа |
 | D-02 | ядро готово, телефон — P2 | `transcript.rs`: подписываемый транскрипт с host_id/service/user/nonce/ts; `challenge.rs`: payload `DLC2` в фрейме v2 |
 | D-03 | **закрыто** | все-нулевая подпись → `ChallengeOutcome::UserDeclined` → `user-declined` → `PAM_AUTHINFO_UNAVAIL` (падение на `pam_unix`) |
-| D-04 | открыто | типизированный RPC и сверка nonce/service/user в PAM — следующий шаг |
+| D-04 | **закрыто** (nonce-часть); service/user требуют `pam_get_item` — отдельный шаг | PAM сверяет эхо `peer_id`+`nonce` и согласованность `ok`/`reason`/`signature`; демон использует nonce вызывающего, а не свой |
 | D-05 | открыто | AEAD сессии — вместе с Wi-Fi транспортом (P2) |
 | D-06 | **закрыто** | сервис и пользователь входят в MAC-транскрипт: тег от `sudo` не проходит для `gdm` |
 | D-07 | открыто | QR-пейринг — P3 |
 
 Тесты: `deunlock-core` 104, `deunlock-presenced` 5 в `challenge_flow` (включая
-`zero_signature_is_classified_as_user_declined`), полный workspace — зелёный.
-`cargo clippy -D warnings` по core/presenced/pam — чисто.
+`zero_signature_is_classified_as_user_declined`), полный workspace — 501 passed,
+0 failed. `cargo clippy -D warnings` по core/presenced/pam — чисто.
+
+D-04 закрыт по nonce-половине: демон использует nonce вызывающего (раньше
+игнорировал и генерировал свой), ответ эхом несёт `peer_id` + `nonce`, PAM
+сверяет их байт-в-байт и отвергает несогласованные `ok`/`reason`/`signature`.
+Остаток: `service`/`user` в запросе — нужен `pam_get_item`, это отдельный шаг
+вместе с v2-проводкой.
