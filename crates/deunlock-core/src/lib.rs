@@ -22,10 +22,20 @@
 
 pub mod bond;
 pub mod frame;
+pub mod kex;
 pub mod mac;
 pub mod replay;
 pub mod secrets;
 pub mod sign;
+pub mod transcript;
+
+pub use kex::{
+    AUTH_MAC_KEY_BYTES, AUTH_MAC_KEY_INFO_V2, BOND_KEY_V2_BYTES, KEX_INFO_V2, KexError, PAIRING_NONCE_LEN, PairingSecret, SEC1_PUBKEY_LEN,
+    SHARED_SECRET_LEN, derive_auth_mac_key, derive_bond_key_v2,
+};
+pub use transcript::{
+    AuthTranscript, MAX_TRANSCRIPT_FIELD_LEN, REQUEST_NONCE_LEN, TRANSCRIPT_DOMAIN_V2, TRANSCRIPT_TAG_LEN, TRANSCRIPT_VERSION, TranscriptError,
+};
 
 pub use bond::{
     BOND_DIR_MODE, BOND_FILE_MODE, BOND_HKDF_INFO_V1, BOND_KEY_DERIVED_BYTES, BOND_SCHEMA_VERSION_LATEST, Bond, BondError, BondStatus,

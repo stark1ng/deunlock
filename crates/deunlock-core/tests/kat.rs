@@ -195,14 +195,14 @@ fn bootstrap_print_kat_vectors() {
         let comma = if i + 1 < inputs.len() { "," } else { "" };
         println!("    {{");
         println!("      \"name\": \"{}\",", input.name);
-        println!("      \"version\": {},", DEUNLOCK_WIRE_VERSION_V1);
+        println!("      \"version\": {DEUNLOCK_WIRE_VERSION_V1},");
         println!("      \"nonce\": \"{}\",", input.nonce_hex);
         println!("      \"payload\": \"{}\",", hex::encode(&input.payload));
         println!("      \"bond_key\": \"{}\",", input.bond_key_hex);
         println!("      \"signing_key\": \"{}\",", input.signing_key_hex);
         println!("      \"expected_tag\": \"{}\",", hex::encode(tag));
         println!("      \"expected_signature\": \"{}\"", hex::encode(sig.to_bytes()));
-        println!("    }}{}", comma);
+        println!("    }}{comma}");
     }
     println!("  ]");
     println!("}}");

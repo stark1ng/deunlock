@@ -55,6 +55,14 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 # workspace resolves a single version.
 hkdf = "0.13"
 sha2 = "0.11"
+# AUDIT-001 D-01: P-256 ECDH for the v2 pairing flow. The phone half runs in
+# the Android Keystore (`PURPOSE_AGREE_KEY`, API 31+), which is why the
+# protocol uses P-256 rather than X25519. `ecdh` pulls in the arithmetic
+# backend this crate already relies on transitively via `hkdf`.
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "std"] }
+# `CryptoRngCore` for `p256::SecretKey::random`; pinned to the 0.6 line that
+# `elliptic-curve` 0.13 consumes so one `OsRng` type is used throughout.
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 # S-006 secret storage — Linux kernel keyring backend (primary).
 # Only compiled on Linux because the underlying `keyctl(2)` syscalls do
