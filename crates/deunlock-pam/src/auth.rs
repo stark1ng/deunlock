@@ -44,7 +44,7 @@ use std::{
 use nix::unistd::{Gid, Uid, fchown};
 use deunlock_core::{Bond, BondError, BondStatus, BondStore, NONCE_LEN};
 use deunlock_presenced::{
-    OUTCOME_REASON_BAD_SIGNATURE, OUTCOME_REASON_BUSY, OUTCOME_REASON_DENIED, OUTCOME_REASON_OK, OUTCOME_REASON_REPLAY,
+    OUTCOME_REASON_BAD_SIGNATURE, OUTCOME_REASON_BUSY, OUTCOME_REASON_DENIED, OUTCOME_REASON_OK, OUTCOME_REASON_REPLAY, OUTCOME_REASON_USER_DECLINED,
     OUTCOME_REASON_RESPONSE_TIMEOUT, OUTCOME_REASON_TRANSPORT_ERROR, OUTCOME_REASON_UNKNOWN_PEER, Request, Response, read_frame_blocking,
     write_frame_blocking,
 };
@@ -216,6 +216,11 @@ pub fn outcome_reason_to_pam(reason: &str) -> (std::ffi::c_int, &'static str) {
         OUTCOME_REASON_DENIED => (PAM_AUTH_ERR, OUTCOME_REASON_DENIED),
         OUTCOME_REASON_REPLAY => (PAM_AUTH_ERR, OUTCOME_REASON_REPLAY),
         OUTCOME_REASON_BAD_SIGNATURE => (PAM_AUTH_ERR, OUTCOME_REASON_BAD_SIGNATURE),
+        // The owner declined on the phone. That is a choice, not a failure:
+        // fall through to `pam_unix` so the password prompt still appears
+        // (AUDIT-001 D-03). A *forged* or malformed signature stays
+        // `bad-signature` above and fails closed.
+        OUTCOME_REASON_USER_DECLINED => (PAM_AUTHINFO_UNAVAIL, OUTCOME_REASON_USER_DECLINED),
         OUTCOME_REASON_RESPONSE_TIMEOUT => (PAM_AUTHINFO_UNAVAIL, OUTCOME_REASON_RESPONSE_TIMEOUT),
         OUTCOME_REASON_OFFLINE => (PAM_AUTHINFO_UNAVAIL, OUTCOME_REASON_OFFLINE),
         OUTCOME_REASON_BUSY => (PAM_AUTHINFO_UNAVAIL, OUTCOME_REASON_BUSY),
@@ -590,6 +595,9 @@ mod tests {
         assert_eq!(outcome_reason_to_pam(OUTCOME_REASON_DENIED).0, PAM_AUTH_ERR);
         assert_eq!(outcome_reason_to_pam(OUTCOME_REASON_REPLAY).0, PAM_AUTH_ERR);
         assert_eq!(outcome_reason_to_pam(OUTCOME_REASON_BAD_SIGNATURE).0, PAM_AUTH_ERR);
+        // AUDIT-001 D-03: the owner declining must fall through to the
+        // password, not kill the stack.
+        assert_eq!(outcome_reason_to_pam(OUTCOME_REASON_USER_DECLINED).0, PAM_AUTHINFO_UNAVAIL);
         assert_eq!(outcome_reason_to_pam(OUTCOME_REASON_RESPONSE_TIMEOUT).0, PAM_AUTHINFO_UNAVAIL);
         assert_eq!(outcome_reason_to_pam(OUTCOME_REASON_OFFLINE).0, PAM_AUTHINFO_UNAVAIL);
         assert_eq!(outcome_reason_to_pam(OUTCOME_REASON_BUSY).0, PAM_AUTHINFO_UNAVAIL);

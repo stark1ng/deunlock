@@ -123,6 +123,20 @@ pub const OUTCOME_REASON_OK: &str = "ok";
 /// [`ChallengeOutcome::Denied`] branch.
 pub const OUTCOME_REASON_DENIED: &str = "denied";
 
+/// `Response::Challenge { reason }` value emitted when the *user* pressed
+/// Decline on the phone.
+///
+/// Kept distinct from [`OUTCOME_REASON_DENIED`] because the two mean opposite
+/// things to the PAM stack: `denied` is an authentication failure and must
+/// fail closed, while `user-declined` is the account owner choosing the
+/// password path, which must fall through to `pam_unix` instead of killing the
+/// whole stack (AUDIT-001 D-03).
+///
+/// The phone signals it with a 64-byte all-zero signature — the same wire
+/// value it has always sent on Cancel, so no Android change is required for
+/// the desktop half to gain correct fallback semantics.
+pub const OUTCOME_REASON_USER_DECLINED: &str = "user-declined";
+
 /// `Response::Challenge { reason }` value emitted for the
 /// [`ChallengeOutcome::Replay`] branch. S-006 never produces this
 /// outcome; the LRU nonce cache that drives it lands in S-007.
@@ -233,6 +247,11 @@ pub enum ChallengeOutcome {
     /// Not produced in S-006 — the denial frame format lands with
     /// the phone-side `ChallengeApprovalActivity` row.
     Denied,
+    /// The account owner pressed Decline on the phone: a 64-byte
+    /// all-zero signature. Distinct from [`Self::Denied`] so PAM can fall
+    /// through to `pam_unix` instead of failing the stack
+    /// (AUDIT-001 D-03).
+    UserDeclined,
     /// The response nonce was previously seen; the LRU rejected the
     /// frame as a replay. Never produced in S-006 — the LRU is
     /// S-007's deliverable. The variant exists so the wire-shape
@@ -263,6 +282,7 @@ impl ChallengeOutcome {
         match self {
             ChallengeOutcome::Ok { .. } => OUTCOME_REASON_OK,
             ChallengeOutcome::Denied => OUTCOME_REASON_DENIED,
+            ChallengeOutcome::UserDeclined => OUTCOME_REASON_USER_DECLINED,
             ChallengeOutcome::Replay => OUTCOME_REASON_REPLAY,
             ChallengeOutcome::BadSignature => OUTCOME_REASON_BAD_SIGNATURE,
             ChallengeOutcome::TimedOut => OUTCOME_REASON_RESPONSE_TIMEOUT,
@@ -985,6 +1005,16 @@ impl Orchestrator {
                 return ChallengeOutcome::BadSignature;
             }
         };
+        // An all-zero signature is the phone's Cancel wire value (see the
+        // `docs/reference/protocol.md` response table). Treat it as "the owner
+        // said no", which lets PAM fall through to the password instead of
+        // failing the whole stack — AUDIT-001 D-03.
+        if signature.to_bytes() == [0u8; SIGNATURE_LEN] {
+            let t_end_ms = epoch_millis(SystemTime::now());
+            self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_USER_DECLINED)
+                .await;
+            return ChallengeOutcome::UserDeclined;
+        }
         let verifying_key = match VerifyingKey::from_bytes(&peer_state.phone_pubkey) {
             Ok(vk) => vk,
             Err(_) => {

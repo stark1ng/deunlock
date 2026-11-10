@@ -30,6 +30,20 @@ use thiserror::Error;
 /// upgraded; see [`FrameError::BadVersion`].
 pub const DEUNLOCK_WIRE_VERSION_V1: u8 = 1;
 
+/// Wire-format version 2.
+///
+/// v2 keeps the v1 byte layout (version ‖ nonce ‖ payload ‖ tag) and changes
+/// only *what* lives in the payload and *what key* the tag is computed with:
+/// the payload carries a [`crate::challenge::ChallengeV2`] built from a
+/// [`crate::transcript::AuthTranscript`], and the tag is keyed with the MAC
+/// key derived from the ECDH bond key rather than from a hash of two public
+/// keys (AUDIT-001 D-01).
+///
+/// v1 frames are still parsed by [`Frame::decode`] so a phone mid-upgrade is
+/// not bricked, but [`Frame::decode_v2`] refuses them — the authentication
+/// path must never silently accept the weaker generation.
+pub const DEUNLOCK_WIRE_VERSION_V2: u8 = 0x02;
+
 /// Length in bytes of the version field.
 pub const VERSION_LEN: usize = 1;
 
@@ -174,6 +188,22 @@ impl Frame {
     /// - `BadLength` if the implied payload length
     ///   (`input.len() - MIN_FRAME_LEN`) exceeds [`MAX_PAYLOAD_LEN`].
     pub fn decode(input: &[u8]) -> Result<Self, FrameError> {
+        Self::decode_expecting(input, DEUNLOCK_WIRE_VERSION_V1)
+    }
+
+    /// Parse a v2 frame, refusing every other version byte.
+    ///
+    /// # Errors
+    ///
+    /// Same failure taxonomy as [`Self::decode`], plus
+    /// [`FrameError::BadVersion`] for a v1 frame: an authentication path that
+    /// speaks v2 must not fall back to the weaker wire generation.
+    pub fn decode_v2(input: &[u8]) -> Result<Self, FrameError> {
+        Self::decode_expecting(input, DEUNLOCK_WIRE_VERSION_V2)
+    }
+
+    /// Parse a frame whose version byte must equal `expected_version`.
+    fn decode_expecting(input: &[u8], expected_version: u8) -> Result<Self, FrameError> {
         if input.len() < MIN_FRAME_LEN {
             return Err(FrameError::TooShort {
                 needed: MIN_FRAME_LEN,
@@ -181,7 +211,7 @@ impl Frame {
             });
         }
         let version = input[VERSION_OFFSET];
-        if version != DEUNLOCK_WIRE_VERSION_V1 {
+        if version != expected_version {
             return Err(FrameError::BadVersion(version));
         }
         let payload_len = input.len() - MIN_FRAME_LEN;
@@ -383,6 +413,57 @@ mod tests {
         frame.encode(&mut buf).expect("encode");
         let parsed = Frame::decode(&buf).expect("decode");
         assert_eq!(parsed, frame);
+    }
+
+    #[test]
+    fn v2_roundtrips_through_the_v2_decoder() {
+        let frame = Frame {
+            version: DEUNLOCK_WIRE_VERSION_V2,
+            nonce: [0x77; NONCE_LEN],
+            payload: vec![0xC2; 96],
+            tag: [0x5A; TAG_LEN],
+        };
+        let mut buf = Vec::new();
+        frame.encode(&mut buf).expect("encode");
+        assert_eq!(buf[VERSION_OFFSET], DEUNLOCK_WIRE_VERSION_V2);
+        assert_eq!(Frame::decode_v2(&buf).expect("decode_v2"), frame);
+    }
+
+    #[test]
+    fn v2_decoder_refuses_v1_frames() {
+        let frame = frame_with_payload(8);
+        let mut buf = Vec::new();
+        frame.encode(&mut buf).expect("encode");
+        assert_eq!(
+            Frame::decode_v2(&buf).expect_err("v1 must not pass the v2 decoder"),
+            FrameError::BadVersion(DEUNLOCK_WIRE_VERSION_V1)
+        );
+    }
+
+    #[test]
+    fn v1_decoder_refuses_v2_frames() {
+        let frame = Frame {
+            version: DEUNLOCK_WIRE_VERSION_V2,
+            nonce: [0x01; NONCE_LEN],
+            payload: vec![0xAA; 8],
+            tag: [0xBB; TAG_LEN],
+        };
+        let mut buf = Vec::new();
+        frame.encode(&mut buf).expect("encode");
+        assert_eq!(
+            Frame::decode(&buf).expect_err("v2 must not pass the v1 decoder"),
+            FrameError::BadVersion(DEUNLOCK_WIRE_VERSION_V2)
+        );
+    }
+
+    #[test]
+    fn v2_decoder_refuses_unknown_versions() {
+        let mut bytes = vec![0u8; MIN_FRAME_LEN];
+        bytes[VERSION_OFFSET] = 0x03;
+        assert_eq!(
+            Frame::decode_v2(&bytes).expect_err("unknown version"),
+            FrameError::BadVersion(0x03)
+        );
     }
 
     proptest! {

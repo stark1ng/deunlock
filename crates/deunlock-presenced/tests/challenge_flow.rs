@@ -334,3 +334,27 @@ async fn audit_log_appended_with_outcome() {
     }
     drop(guard);
 }
+
+/// AUDIT-001 D-03: the phone's Cancel wire value is 64 zero bytes. It must be
+/// classified as an explicit user decline — not as a bad signature — so PAM
+/// can fall through to the password prompt instead of failing the stack.
+#[tokio::test]
+async fn zero_signature_is_classified_as_user_declined() {
+    use deunlock_presenced::OUTCOME_REASON_USER_DECLINED;
+
+    let signing_key = SigningKey::from_bytes(&SIGNING_KEY_SEED);
+    let bond = fixture_bond(&signing_key);
+    let td = TempDir::new().expect("tempdir");
+    let (audit_log, audit_path) = open_audit_log(&td);
+    let fake = FakePeripheral::new();
+    let orchestrator = build_orchestrator(fake.clone(), bond.clone(), audit_log).await;
+
+    fake.inject_response(&bond.peer_id, vec![0u8; SIGNATURE_LEN]);
+
+    let outcome = orchestrator.issue_challenge(&bond.peer_id, DEFAULT_AUTH_TIMEOUT).await;
+    match outcome {
+        ChallengeOutcome::UserDeclined => {}
+        other => panic!("expected UserDeclined, got {other:?}"),
+    }
+    assert_eq!(outcome_columns(&audit_path), vec![OUTCOME_REASON_USER_DECLINED.to_owned()]);
+}
