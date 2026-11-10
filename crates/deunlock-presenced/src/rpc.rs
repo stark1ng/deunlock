@@ -56,6 +56,11 @@ pub enum Request {
         /// byte-string item, not an array of integers).
         #[serde(with = "serde_bytes")]
         nonce: Vec<u8>,
+        /// PAM service name (`sudo`, `gdm`, `polkit`, ...), read by the module
+        /// through `pam_get_item(PAM_SERVICE)`.
+        service: String,
+        /// Account the decision is about (`pam_get_item(PAM_USER)`).
+        user: String,
     },
     /// Operator-driven re-load of the bonds.toml + keys directory.
     /// S-005 implements the side effect; S-002 just sends/decodes.
@@ -356,6 +361,8 @@ mod tests {
         let original = Request::Challenge {
             peer_id: "test-peer".to_string(),
             nonce: TEST_NONCE.to_vec(),
+            service: "sudo".to_string(),
+            user: "roma".to_string(),
         };
         assert_eq!(round_trip_request(&original), original);
     }
@@ -477,6 +484,8 @@ mod tests {
         let original = Request::Challenge {
             peer_id: "peer-a".to_string(),
             nonce: TEST_NONCE.to_vec(),
+            service: "sudo".to_string(),
+            user: "roma".to_string(),
         };
         let mut buf: Vec<u8> = Vec::new();
         write_frame_blocking(&mut buf, &original).expect("write_frame_blocking");

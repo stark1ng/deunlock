@@ -87,6 +87,7 @@ impl Daemon {
             // (`reason="not-implemented"`) on this path so the
             // existing assertions stay green.
             orchestrator: None,
+            host_id: None,
             test_fixed_nonce: None,
             started_at: None,
         };
@@ -141,6 +142,8 @@ async fn send_challenge(stream: &mut UnixStream) -> Result<(), deunlock_presence
     let request = Request::Challenge {
         peer_id: "test-peer".to_string(),
         nonce: TEST_NONCE.to_vec(),
+        service: "sudo".to_string(),
+        user: "roma".to_string(),
     };
     write_frame(stream, &request).await
 }

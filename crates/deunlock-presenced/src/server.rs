@@ -156,6 +156,14 @@ pub struct ServeConfig {
     /// the `socket_smoke` + `lifecycle_smoke` tests that do not
     /// spin up an orchestrator.
     pub orchestrator: Option<Arc<Orchestrator>>,
+    /// This desktop's `host_id`, when a host identity has been provisioned.
+    ///
+    /// `Some(_)` makes the dispatcher issue **v2** challenges carrying a
+    /// transcript (host, service, account). `None` — a daemon whose
+    /// `/etc/deunlock/host.key` has not been created yet — keeps the legacy v1
+    /// shape so a half-installed system still authenticates rather than
+    /// bricking.
+    pub host_id: Option<[u8; 32]>,
     /// S-008 test seam — when `Some(_)`, the dispatcher calls
     /// `Orchestrator::issue_challenge_with_nonce` with this fixed
     /// nonce instead of `issue_challenge` (which generates a
@@ -192,6 +200,7 @@ where
     let reload_tx = config.reload_tx.clone();
     let orchestrator = config.orchestrator.clone();
     let test_fixed_nonce = config.test_fixed_nonce;
+    let host_id = config.host_id;
     let started_at = config.started_at.unwrap_or_else(SystemTime::now);
     let semaphore = Arc::new(Semaphore::new(CONCURRENT_ACCEPT_CAP));
     tracing::info!(
@@ -230,12 +239,15 @@ where
                 };
                 spawn_connection(
                     stream,
-                    expected_uid,
                     permit,
-                    reload_tx.clone(),
-                    orchestrator.clone(),
-                    test_fixed_nonce,
-                    started_at,
+                    ConnContext {
+                        expected_uid,
+                        reload_tx: reload_tx.clone(),
+                        orchestrator: orchestrator.clone(),
+                        test_fixed_nonce,
+                        started_at,
+                        host_id,
+                    },
                 );
             }
         }
@@ -259,21 +271,25 @@ fn set_socket_mode(path: &Path) -> Result<(), ServeError> {
     Ok(())
 }
 
-fn spawn_connection(
-    stream: UnixStream,
+/// Per-connection context, cloned out of [`ServeConfig`] for every accepted
+/// socket so the handler signature stays readable.
+#[derive(Clone)]
+struct ConnContext {
     expected_uid: u32,
-    permit: OwnedSemaphorePermit,
     reload_tx: Option<mpsc::Sender<ReloadCommand>>,
     orchestrator: Option<Arc<Orchestrator>>,
     test_fixed_nonce: Option<[u8; NONCE_BYTES]>,
     started_at: SystemTime,
-) -> JoinHandle<()> {
+    host_id: Option<[u8; 32]>,
+}
+
+fn spawn_connection(stream: UnixStream, permit: OwnedSemaphorePermit, ctx: ConnContext) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Hold `permit` for the lifetime of this task; `Drop`
         // releases it (even on panic) and unblocks any queued accept
         // waiting on the cap.
         let _permit = permit;
-        if let Err(err) = handle_connection(stream, expected_uid, reload_tx, orchestrator, test_fixed_nonce, started_at).await {
+        if let Err(err) = handle_connection(stream, ctx).await {
             tracing::debug!(error = %err, "connection handler returned with error");
         }
     })
@@ -284,14 +300,7 @@ fn spawn_connection(
 /// response. Closes the connection on completion — the SPEC's PAM
 /// caller does one `connect` + one `Challenge` + one read per PAM
 /// call.
-async fn handle_connection(
-    mut stream: UnixStream,
-    expected_uid: u32,
-    reload_tx: Option<mpsc::Sender<ReloadCommand>>,
-    orchestrator: Option<Arc<Orchestrator>>,
-    test_fixed_nonce: Option<[u8; NONCE_BYTES]>,
-    started_at: SystemTime,
-) -> Result<(), HandlerError> {
+async fn handle_connection(mut stream: UnixStream, ctx: ConnContext) -> Result<(), HandlerError> {
     let creds = getsockopt(&stream, PeerCredentials).map_err(HandlerError::PeerCredentials)?;
     let peer_uid = creds.uid();
     // SPEC §7 T-Local-Privilege-Escalation: the filesystem ACL on the socket
@@ -302,17 +311,25 @@ async fn handle_connection(
     // the peer as `nobody` (65534) on the daemon side. Accept root (0), the
     // daemon's UID, and `nobody` (the sudo-namespace case); log everything
     // else as a warning but still allow.
-    if peer_uid != expected_uid && peer_uid != UID_ROOT && peer_uid != UID_NOBODY {
+    if peer_uid != ctx.expected_uid && peer_uid != UID_ROOT && peer_uid != UID_NOBODY {
         tracing::warn!(
             uid = peer_uid,
-            expected_uid,
+            expected_uid = ctx.expected_uid,
             peer_pid = creds.pid(),
             "accepting connection from unexpected uid (filesystem ACL is primary defense)"
         );
     }
     let request: Request = read_frame(&mut stream).await?;
     tracing::debug!(?request, "request decoded");
-    let response = dispatch(&request, &reload_tx, orchestrator.as_ref(), test_fixed_nonce, started_at).await;
+    let response = dispatch(
+        &request,
+        &ctx.reload_tx,
+        ctx.orchestrator.as_ref(),
+        ctx.test_fixed_nonce,
+        ctx.started_at,
+        ctx.host_id,
+    )
+    .await;
     write_frame(&mut stream, &response).await?;
     Ok(())
 }
@@ -341,9 +358,10 @@ async fn dispatch(
     orchestrator: Option<&Arc<Orchestrator>>,
     test_fixed_nonce: Option<[u8; NONCE_BYTES]>,
     started_at: SystemTime,
+    host_id: Option<[u8; 32]>,
 ) -> Response {
     match request {
-        Request::Challenge { peer_id, nonce } => {
+        Request::Challenge { peer_id, nonce, service, user } => {
             let requested = match <[u8; NONCE_BYTES]>::try_from(nonce.as_slice()) {
                 Ok(n) => n,
                 Err(_) => {
@@ -364,7 +382,16 @@ async fn dispatch(
                     // `test_fixed_nonce` overrides it for the deterministic
                     // harness, and the echo reports whichever value was used.
                     let used_nonce = test_fixed_nonce.unwrap_or(requested);
-                    let outcome = o.issue_challenge_with_nonce(peer_id, used_nonce, DEFAULT_AUTH_TIMEOUT).await;
+                    let outcome = match host_id {
+                        // v2: the phone is asked to approve a transcript that
+                        // names this desktop, the service and the account.
+                        Some(host_id) => {
+                            o.issue_challenge_v2(peer_id, used_nonce, host_id, service, user, DEFAULT_AUTH_TIMEOUT)
+                                .await
+                        }
+                        // No provisioned identity yet: keep the legacy shape.
+                        None => o.issue_challenge_with_nonce(peer_id, used_nonce, DEFAULT_AUTH_TIMEOUT).await,
+                    };
                     let signature = outcome.signature_bytes();
                     let ok = matches!(outcome, crate::orchestrator::ChallengeOutcome::Ok { .. });
                     Response::Challenge {

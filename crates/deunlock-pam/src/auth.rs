@@ -262,7 +262,39 @@ pub fn outcome_reason_to_pam(reason: &str) -> (std::ffi::c_int, &'static str) {
 /// call.
 #[must_use]
 pub fn authenticate(cfg: &Config) -> AuthOutcome {
-    let outcome = authenticate_inner(cfg);
+    authenticate_with_context(cfg, &PamContext::unknown())
+}
+
+/// PAM request context: which service asked, and for which account.
+///
+/// Read by the C entry point through `pam_get_item(PAM_SERVICE)` and
+/// `pam_get_item(PAM_USER)`. Both fields end up in the v2 transcript, so the
+/// phone can display *what* it is approving, and a signature minted for one
+/// service cannot be replayed for another (AUDIT-001 D-02/D-06).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PamContext {
+    /// PAM service name (`sudo`, `gdm`, `polkit`, ...).
+    pub service: String,
+    /// Account the decision is about.
+    pub user: String,
+}
+
+impl PamContext {
+    /// Placeholder used when libpam did not supply the items (unit tests, and
+    /// any caller that is not the C entry point).
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self {
+            service: "unknown".to_string(),
+            user: "unknown".to_string(),
+        }
+    }
+}
+
+/// Run the flow with an explicit PAM context.
+#[must_use]
+pub fn authenticate_with_context(cfg: &Config, ctx: &PamContext) -> AuthOutcome {
+    let outcome = authenticate_inner(cfg, ctx);
     // Best-effort audit log; failure here does not change the PAM
     // code (SPEC §6 audit is a forensic surface, not a control flow
     // surface).
@@ -270,7 +302,7 @@ pub fn authenticate(cfg: &Config) -> AuthOutcome {
     outcome
 }
 
-fn authenticate_inner(cfg: &Config) -> AuthOutcome {
+fn authenticate_inner(cfg: &Config, ctx: &PamContext) -> AuthOutcome {
     // -- step 1: load the bond store to pick a peer_id ------------------
     let peer_id = match resolve_peer_id(cfg) {
         Ok(id) => id,
@@ -294,7 +326,7 @@ fn authenticate_inner(cfg: &Config) -> AuthOutcome {
     }
 
     // -- step 3: daemon round-trip --------------------------------------
-    let response = match daemon_round_trip(&cfg.socket_path, &peer_id, &nonce, cfg.auth_timeout) {
+    let response = match daemon_round_trip(&cfg.socket_path, &peer_id, &nonce, cfg.auth_timeout, ctx) {
         Ok(r) => r,
         Err(()) => {
             // Connect-refused / socket missing / write fail / read
@@ -421,7 +453,13 @@ fn getrandom_fill(buf: &mut [u8]) -> Result<(), ()> {
 /// Open the daemon's Unix socket, write one `Request::Challenge`,
 /// read one `Response`. Returns `Err(())` on any failure — the
 /// caller maps that to `OUTCOME_REASON_TRANSPORT_ERROR`.
-fn daemon_round_trip(socket_path: &Path, peer_id: &str, nonce: &[u8; NONCE_LEN], auth_timeout: Duration) -> Result<Response, ()> {
+fn daemon_round_trip(
+    socket_path: &Path,
+    peer_id: &str,
+    nonce: &[u8; NONCE_LEN],
+    auth_timeout: Duration,
+    ctx: &PamContext,
+) -> Result<Response, ()> {
     let mut stream = match UnixStream::connect_addr_from_path(socket_path) {
         Ok(s) => s,
         Err(_) => return Err(()),
@@ -435,6 +473,8 @@ fn daemon_round_trip(socket_path: &Path, peer_id: &str, nonce: &[u8; NONCE_LEN],
     let request = Request::Challenge {
         peer_id: peer_id.to_owned(),
         nonce: nonce.to_vec(),
+        service: ctx.service.clone(),
+        user: ctx.user.clone(),
     };
     if write_frame_blocking(&mut stream, &request).is_err() {
         return Err(());
@@ -574,7 +614,7 @@ mod tests {
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                     if let Ok(req) = deunlock_presenced::read_frame_blocking::<_, Request>(&mut stream) {
                         let (echoed_peer, echoed_nonce) = match req {
-                            Request::Challenge { peer_id, nonce } => {
+                            Request::Challenge { peer_id, nonce, .. } => {
                                 let echoed = if corrupt_echo { vec![0xFFu8; nonce.len()] } else { nonce };
                                 (peer_id, echoed)
                             }

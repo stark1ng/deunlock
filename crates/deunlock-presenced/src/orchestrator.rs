@@ -32,8 +32,8 @@ use std::{
 };
 
 use deunlock_core::{
-    Bond, BondStore, Frame, NONCE_LEN, SIGNATURE_LEN, DEUNLOCK_WIRE_VERSION_V1, Signature, TAG_LEN, VerifyingKey, bond::PUBKEY_LEN,
-    verify_frame,
+    AuthTranscript, Bond, BondStore, ChallengeV2, Frame, NONCE_LEN, SIGNATURE_LEN, DEUNLOCK_WIRE_VERSION_V1, Signature, TAG_LEN, VerifyingKey,
+    bond::PUBKEY_LEN, verify_frame, verify_transcript,
 };
 use deunlock_transport::{BOND_KEY_BYTES, Peripheral, PeripheralError, session_uuid_for};
 use tokio::{
@@ -228,6 +228,27 @@ impl NonceCache {
             self.nonces.pop_front();
         }
     }
+}
+
+/// What kind of challenge to put on the wire.
+///
+/// `V1` is the historical frame: a bare nonce MAC'd with a key derived from two
+/// public keys. `V2` carries the transcript, so the phone can tell *which*
+/// desktop, service and account it is approving before it asks for a
+/// fingerprint (AUDIT-001 D-01/D-02/D-06).
+#[derive(Debug, Clone, Copy)]
+pub enum ChallengeSpec<'a> {
+    /// Legacy v1 frame.
+    V1,
+    /// v2 frame carrying an [`AuthTranscript`].
+    V2 {
+        /// This desktop's `host_id`.
+        host_id: [u8; 32],
+        /// PAM service the request is for (`sudo`, `gdm`, ...).
+        service: &'a str,
+        /// Account the decision is about.
+        user: &'a str,
+    },
 }
 
 /// Typed outcome of [`Orchestrator::issue_challenge`]. Maps 1:1 to
@@ -881,7 +902,7 @@ impl Orchestrator {
                 reason: format!("nonce rng: {err}"),
             });
         }
-        let outcome = self.run_challenge(peer_id, nonce, deadline, &peer_state, t_start_ms).await;
+        let outcome = self.run_challenge(peer_id, nonce, deadline, &peer_state, t_start_ms, ChallengeSpec::V1).await;
         drop(permit);
         outcome
     }
@@ -911,7 +932,56 @@ impl Orchestrator {
             }
         };
         stamp_liveness(&peer_state.liveness, SystemTime::now()).await;
-        let outcome = self.run_challenge(peer_id, nonce, deadline, &peer_state, t_start_ms).await;
+        let outcome = self.run_challenge(peer_id, nonce, deadline, &peer_state, t_start_ms, ChallengeSpec::V1).await;
+        drop(permit);
+        outcome
+    }
+
+    /// Issue a **v2** challenge for one peer with an explicit nonce.
+    ///
+    /// The phone receives a `DLC2` payload naming the desktop (`host_id`), the
+    /// PAM service and the account, MAC'd with the bond key. It approves that
+    /// transcript, and the returned signature is verified against the same
+    /// bytes — so a signature for `sudo` on this host cannot be replayed for
+    /// `gdm` or for another machine.
+    pub async fn issue_challenge_v2(
+        &self,
+        peer_id: &str,
+        nonce: [u8; NONCE_BYTES],
+        host_id: [u8; 32],
+        service: &str,
+        user: &str,
+        deadline: StdDuration,
+    ) -> ChallengeOutcome {
+        let t_start_ms = epoch_millis(SystemTime::now());
+        let peer_state = match self.lookup_peer(peer_id).await {
+            Some(s) => s,
+            None => {
+                self.audit_outcome(peer_id, ZERO_NONCE_HEX, t_start_ms, OUTCOME_REASON_UNKNOWN_PEER)
+                    .await;
+                return ChallengeOutcome::UnknownPeer;
+            }
+        };
+        let permit = match self.acquire_challenge_slot(&peer_state.challenge_slot).await {
+            Some(p) => p,
+            None => {
+                let t_end_ms = epoch_millis(SystemTime::now());
+                self.audit_at(peer_id, ZERO_NONCE_HEX, t_start_ms, t_end_ms, OUTCOME_REASON_BUSY)
+                    .await;
+                return ChallengeOutcome::Busy;
+            }
+        };
+        stamp_liveness(&peer_state.liveness, SystemTime::now()).await;
+        let outcome = self
+            .run_challenge(
+                peer_id,
+                nonce,
+                deadline,
+                &peer_state,
+                t_start_ms,
+                ChallengeSpec::V2 { host_id, service, user },
+            )
+            .await;
         drop(permit);
         outcome
     }
@@ -943,29 +1013,63 @@ impl Orchestrator {
         deadline: StdDuration,
         peer_state: &PeerState,
         t_start_ms: u128,
+        spec: ChallengeSpec<'_>,
     ) -> ChallengeOutcome {
         let nonce_hex = hex::encode(nonce);
-        let mut challenge = Frame {
-            version: DEUNLOCK_WIRE_VERSION_V1,
-            nonce,
-            payload: Vec::new(),
-            tag: [0u8; TAG_LEN],
-        };
-        // Compute the BLAKE3-keyed-hash MAC over the frame body so the
-        // phone's `verifyChallengeFrame(bond_key, frame)` accepts it.
-        // S-006's stub left tag=zero; the phone correctly rejects that
-        // as "frame verify failed".
-        match challenge.body_bytes() {
-            Ok(body) => challenge.tag = deunlock_core::compute_tag(&peer_state.bond_key, &body),
-            Err(err) => {
-                let t_end_ms = epoch_millis(SystemTime::now());
-                self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_TRANSPORT_ERROR)
-                    .await;
-                return ChallengeOutcome::TransportError(PeripheralError::Backend {
-                    reason: format!("challenge body_bytes: {err}"),
-                });
+        let (challenge, transcript) = match &spec {
+            ChallengeSpec::V1 => {
+                let mut frame = Frame {
+                    version: DEUNLOCK_WIRE_VERSION_V1,
+                    nonce,
+                    payload: Vec::new(),
+                    tag: [0u8; TAG_LEN],
+                };
+                // Compute the BLAKE3-keyed-hash MAC over the frame body so the
+                // phone's `verifyChallengeFrame(bond_key, frame)` accepts it.
+                match frame.body_bytes() {
+                    Ok(body) => frame.tag = deunlock_core::compute_tag(&peer_state.bond_key, &body),
+                    Err(err) => {
+                        let t_end_ms = epoch_millis(SystemTime::now());
+                        self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_TRANSPORT_ERROR)
+                            .await;
+                        return ChallengeOutcome::TransportError(PeripheralError::Backend {
+                            reason: format!("challenge body_bytes: {err}"),
+                        });
+                    }
+                }
+                (frame, None)
             }
-        }
+            ChallengeSpec::V2 { host_id, service, user } => {
+                let issued_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default();
+                let transcript = match AuthTranscript::new(*host_id, service, user, nonce, issued_at) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        let t_end_ms = epoch_millis(SystemTime::now());
+                        self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_TRANSPORT_ERROR)
+                            .await;
+                        return ChallengeOutcome::TransportError(PeripheralError::Backend {
+                            reason: format!("challenge transcript: {err}"),
+                        });
+                    }
+                };
+                let challenge = ChallengeV2::new(transcript.clone(), &peer_state.bond_key);
+                let frame = match challenge.to_frame() {
+                    Ok(f) => f,
+                    Err(err) => {
+                        let t_end_ms = epoch_millis(SystemTime::now());
+                        self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_TRANSPORT_ERROR)
+                            .await;
+                        return ChallengeOutcome::TransportError(PeripheralError::Backend {
+                            reason: format!("challenge frame: {err}"),
+                        });
+                    }
+                };
+                (frame, Some(transcript))
+            }
+        };
         let mut encoded: Vec<u8> = Vec::new();
         if let Err(err) = challenge.encode(&mut encoded) {
             let t_end_ms = epoch_millis(SystemTime::now());
@@ -1024,7 +1128,13 @@ impl Orchestrator {
                 return ChallengeOutcome::BadSignature;
             }
         };
-        if let Err(_e) = verify_frame(&verifying_key, &challenge, &signature) {
+        // v1 verified the frame body; v2 verifies the transcript, which is the
+        // same byte string the phone MAC-checked before touching a fingerprint.
+        let verified = match &transcript {
+            Some(t) => verify_transcript(&verifying_key, t, &signature),
+            None => verify_frame(&verifying_key, &challenge, &signature),
+        };
+        if verified.is_err() {
             let t_end_ms = epoch_millis(SystemTime::now());
             self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_BAD_SIGNATURE)
                 .await;

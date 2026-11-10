@@ -52,7 +52,7 @@ pub use bond::{
 };
 pub use frame::{
     Frame, FrameError, HEADER_LEN, MAX_FRAME_LEN, MAX_PAYLOAD_LEN, MIN_FRAME_LEN, NONCE_LEN, NONCE_OFFSET, PAYLOAD_OFFSET,
-    DEUNLOCK_WIRE_VERSION_V1, TAG_LEN, VERSION_LEN, VERSION_OFFSET,
+    DEUNLOCK_WIRE_VERSION_V1, DEUNLOCK_WIRE_VERSION_V2, TAG_LEN, VERSION_LEN, VERSION_OFFSET,
 };
 pub use mac::{BOND_KEY_BYTES, MAC_TAG_LEN, compute_tag, verify_tag};
 pub use replay::{Acceptance, DEFAULT_REPLAY_CAP, DEFAULT_REPLAY_TTL, ReplayCache};
@@ -61,4 +61,7 @@ pub use secrets::{
     SECRET_SERVICE_ATTR_KIND, SECRET_SERVICE_ATTR_KIND_VALUE, SECRET_SERVICE_COLLECTION, SECRET_SERVICE_CONTENT_TYPE, SecretError, detect,
     detect_with_logger,
 };
-pub use sign::{SIGNATURE_LEN, SIGNED_MESSAGE_PREFIX_LEN, Signature, SigningKey, VerifyError, VerifyingKey, sign_frame, verify_frame};
+pub use sign::{
+    SIGNATURE_LEN, SIGNED_MESSAGE_PREFIX_LEN, Signature, SigningKey, VerifyError, VerifyingKey, sign_frame, sign_transcript, verify_frame,
+    verify_transcript,
+};

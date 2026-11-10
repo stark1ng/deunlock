@@ -220,11 +220,25 @@ pub async fn run(config: Config) -> Result<ShutdownReason, RunError> {
     let (orch_task, reload_tx, orch_handle) = maybe_spawn_orchestrator(&config, orch_shutdown_rx).await?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // The desktop's identity, provisioned by `deunlock pair --host-key`. When it
+    // is missing the daemon still runs, but challenges stay v1 — a half-installed
+    // system authenticates instead of bricking. `DEUNLOCK_HOST_KEY` lets tests
+    // and non-standard installs point elsewhere.
+    let host_key_path = std::env::var_os("DEUNLOCK_HOST_KEY")
+        .map_or_else(|| std::path::PathBuf::from(deunlock_core::DEFAULT_HOST_KEY_PATH), std::path::PathBuf::from);
+    let host_id = match deunlock_core::HostIdentity::load(&host_key_path) {
+        Ok(identity) => Some(identity.host_id()),
+        Err(err) => {
+            tracing::warn!(path = %host_key_path.display(), error = %err, "no host identity; issuing v1 challenges");
+            None
+        }
+    };
     let serve_config = ServeConfig {
         socket_path: config.socket.clone(),
         expected_uid: config.expected_uid,
         reload_tx: reload_tx.clone(),
         orchestrator: orch_handle.clone(),
+        host_id,
         test_fixed_nonce: config.test_fixed_nonce,
         started_at: Some(std::time::SystemTime::now()),
     };

@@ -16,6 +16,7 @@ pub use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use thiserror::Error;
 
 use crate::frame::{Frame, FrameError};
+use crate::transcript::AuthTranscript as Transcript;
 
 /// Number of bytes the prefix of the signed message occupies (version +
 /// nonce). The full signed message is this prefix followed by the
@@ -82,6 +83,28 @@ pub fn sign_frame(privkey: &SigningKey, frame: &Frame) -> Result<Signature, Fram
 pub fn verify_frame(pubkey: &VerifyingKey, frame: &Frame, sig: &Signature) -> Result<(), VerifyError> {
     let body = frame.body_bytes()?;
     pubkey.verify_strict(&body, sig)?;
+    Ok(())
+}
+
+/// Sign a v2 authentication transcript.
+///
+/// The phone signs exactly the bytes it MAC-verified
+/// ([`crate::transcript::AuthTranscript::encode`]), so there is one canonical
+/// message per request instead of "whatever the frame body happened to be".
+/// A signature therefore cannot be detached from the `host_id`, `service`,
+/// `user`, nonce or timestamp it was minted for (AUDIT-001 D-02/D-06).
+#[must_use]
+pub fn sign_transcript(privkey: &SigningKey, transcript: &Transcript) -> Signature {
+    privkey.sign(&transcript.encode())
+}
+
+/// Verify `sig` over a v2 transcript under `pubkey`.
+///
+/// # Errors
+///
+/// [`VerifyError`] when the signature is malformed or does not match.
+pub fn verify_transcript(pubkey: &VerifyingKey, transcript: &Transcript, sig: &Signature) -> Result<(), VerifyError> {
+    pubkey.verify_strict(&transcript.encode(), sig)?;
     Ok(())
 }
 

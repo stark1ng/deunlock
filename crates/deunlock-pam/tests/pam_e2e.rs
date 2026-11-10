@@ -70,7 +70,7 @@ impl MockDaemon {
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                 if let Ok(req) = read_frame_blocking::<_, Request>(&mut stream) {
                     let (echo_peer, echo_nonce) = match &req {
-                        Request::Challenge { peer_id, nonce } => (peer_id.clone(), nonce.clone()),
+                        Request::Challenge { peer_id, nonce, .. } => (peer_id.clone(), nonce.clone()),
                         _ => (String::new(), Vec::new()),
                     };
                     let signature = if include_signature { Some(vec![0xAA; SIGNATURE_LEN]) } else { None };

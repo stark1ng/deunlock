@@ -30,8 +30,8 @@ use std::{
 };
 
 use deunlock_core::{
-    Bond, BondStatus, Frame, NONCE_LEN, SIGNATURE_LEN, DEUNLOCK_WIRE_VERSION_V1, SigningKey, bond::PUBKEY_LEN, compute_tag,
-    peer_id_from_pubkey, sign_frame,
+    Bond, BondStatus, ChallengeV2, Frame, NONCE_LEN, SIGNATURE_LEN, DEUNLOCK_WIRE_VERSION_V1, SigningKey, bond::PUBKEY_LEN, compute_tag,
+    peer_id_from_pubkey, sign_frame, sign_transcript,
 };
 use deunlock_presenced::{
     AuditLog, ChallengeOutcome, DEFAULT_AUTH_TIMEOUT, OUTCOME_REASON_BAD_SIGNATURE, OUTCOME_REASON_OK, OUTCOME_REASON_RESPONSE_TIMEOUT,
@@ -357,4 +357,92 @@ async fn zero_signature_is_classified_as_user_declined() {
         other => panic!("expected UserDeclined, got {other:?}"),
     }
     assert_eq!(outcome_columns(&audit_path), vec![OUTCOME_REASON_USER_DECLINED.to_owned()]);
+}
+
+/// The v2 path: the phone is asked to approve a transcript naming the host,
+/// the service and the account, and the signature it returns is verified over
+/// those exact bytes (AUDIT-001 D-01/D-02/D-06).
+#[tokio::test]
+async fn v2_challenge_carries_a_transcript_and_accepts_a_transcript_signature() {
+    let signing_key = SigningKey::from_bytes(&SIGNING_KEY_SEED);
+    let bond = fixture_bond(&signing_key);
+    let td = TempDir::new().expect("tempdir");
+    let (audit_log, audit_path) = open_audit_log(&td);
+    let fake = FakePeripheral::new();
+    let orchestrator = build_orchestrator(fake.clone(), bond.clone(), audit_log).await;
+
+    let before_idx = fake.notify_calls().len();
+    let host_id = [0x5Au8; 32];
+    let nonce = [0x11u8; NONCE_LEN];
+    let orchestrator_clone = Arc::clone(&orchestrator);
+    let peer_id = bond.peer_id.clone();
+    let challenge_task = tokio::spawn(async move {
+        orchestrator_clone
+            .issue_challenge_v2(&peer_id, nonce, host_id, "sudo", "roma", DEFAULT_AUTH_TIMEOUT)
+            .await
+    });
+
+    let notify_bytes = wait_until_notified_after(&fake, &bond.peer_id, before_idx).await;
+
+    // What the phone would see: a v2 frame whose payload is a DLC2 challenge.
+    let frame = Frame::decode_v2(&notify_bytes).expect("v2 frame");
+    assert_eq!(frame.version, deunlock_core::DEUNLOCK_WIRE_VERSION_V2);
+    let challenge = ChallengeV2::from_frame(&frame).expect("decode challenge");
+    assert!(challenge.verify(&BOND_KEY), "MAC must verify under the bond key");
+    assert_eq!(challenge.transcript().service(), "sudo");
+    assert_eq!(challenge.transcript().user(), "roma");
+    assert_eq!(challenge.transcript().host_id(), &host_id);
+    assert_eq!(challenge.transcript().nonce(), &nonce);
+
+    let signature = sign_transcript(&signing_key, challenge.transcript());
+    fake.inject_response(&bond.peer_id, signature.to_bytes().to_vec());
+
+    match challenge_task.await.expect("join") {
+        ChallengeOutcome::Ok { .. } => {}
+        other => panic!("expected Ok, got {other:?}"),
+    }
+    assert_eq!(outcome_columns(&audit_path), vec![OUTCOME_REASON_OK.to_owned()]);
+}
+
+/// A signature minted over a *different* service must not satisfy the v2
+/// verifier, even though the nonce matches.
+#[tokio::test]
+async fn v2_rejects_a_signature_made_for_another_service() {
+    let signing_key = SigningKey::from_bytes(&SIGNING_KEY_SEED);
+    let bond = fixture_bond(&signing_key);
+    let td = TempDir::new().expect("tempdir");
+    let (audit_log, _audit_path) = open_audit_log(&td);
+    let fake = FakePeripheral::new();
+    let orchestrator = build_orchestrator(fake.clone(), bond.clone(), audit_log).await;
+
+    let before_idx = fake.notify_calls().len();
+    let nonce = [0x22u8; NONCE_LEN];
+    let orchestrator_clone = Arc::clone(&orchestrator);
+    let peer_id = bond.peer_id.clone();
+    let challenge_task = tokio::spawn(async move {
+        orchestrator_clone
+            .issue_challenge_v2(&peer_id, nonce, [0x5A; 32], "sudo", "roma", DEFAULT_AUTH_TIMEOUT)
+            .await
+    });
+
+    let notify_bytes = wait_until_notified_after(&fake, &bond.peer_id, before_idx).await;
+    let frame = Frame::decode_v2(&notify_bytes).expect("v2 frame");
+    let challenge = ChallengeV2::from_frame(&frame).expect("decode challenge");
+
+    // Same host/user/nonce/timestamp, different service.
+    let forged = deunlock_core::AuthTranscript::new(
+        [0x5A; 32],
+        "gdm",
+        "roma",
+        nonce,
+        challenge.transcript().issued_at(),
+    )
+    .expect("transcript");
+    let signature = sign_transcript(&signing_key, &forged);
+    fake.inject_response(&bond.peer_id, signature.to_bytes().to_vec());
+
+    match challenge_task.await.expect("join") {
+        ChallengeOutcome::BadSignature => {}
+        other => panic!("expected BadSignature, got {other:?}"),
+    }
 }

@@ -17,7 +17,7 @@
 //! `PAM_AUTHINFO_UNAVAIL` — account management is out of scope for v0.1.
 
 use std::{
-    ffi::c_int,
+    ffi::{CStr, c_int},
     os::raw::{c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
 };
@@ -25,6 +25,50 @@ use std::{
 use syslog::{Facility, Formatter3164};
 
 use crate::{auth, config::Config};
+
+// -----------------------------------------------------------------------------
+// libpam items
+// -----------------------------------------------------------------------------
+
+/// `PAM_SERVICE` — the service name (`sudo`, `gdm`, ...).
+const PAM_ITEM_SERVICE: c_int = 1;
+
+/// `PAM_USER` — the account being authenticated.
+const PAM_ITEM_USER: c_int = 2;
+
+// libpam exports these symbols into the process that loaded us; the dynamic
+// loader resolves them at load time. Declaring them here is the whole cost of
+// reading PAM items — no `pam-sys` dependency needed.
+unsafe extern "C" {
+    /// `int pam_get_item(const pam_handle_t *, int, const void **)`.
+    fn pam_get_item(pamh: *const c_void, item_type: c_int, item: *mut *const c_void) -> c_int;
+}
+
+/// Read one string item from the PAM handle.
+///
+/// Returns `None` when the handle or the item is absent, the call fails, or the
+/// bytes are not UTF-8. The pointer libpam hands back is owned by libpam and
+/// valid for the duration of the `pam_sm_*` call, so the value is copied out
+/// immediately.
+///
+/// # Safety
+///
+/// `pamh` must be the handle libpam passed into the entry point, or null.
+unsafe fn pam_string_item(pamh: *mut c_void, item_type: c_int) -> Option<String> {
+    if pamh.is_null() {
+        return None;
+    }
+    let mut item: *const c_void = std::ptr::null();
+    // SAFETY: `pamh` is a live PAM handle per this function's contract, and
+    // `item` is a valid out-pointer for the duration of the call.
+    let rc = unsafe { pam_get_item(pamh.cast_const(), item_type, &mut item) };
+    if rc != PAM_SUCCESS || item.is_null() {
+        return None;
+    }
+    // SAFETY: libpam returns a NUL-terminated string for string item types.
+    let cstr = unsafe { CStr::from_ptr(item.cast::<c_char>()) };
+    cstr.to_str().ok().map(str::to_owned)
+}
 
 // -----------------------------------------------------------------------------
 // PAM return-code constants
@@ -168,7 +212,7 @@ where
 /// In the S-008 stub we read neither pointer; the parameters exist to match
 /// the ABI signature.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pam_sm_authenticate(_pamh: *mut c_void, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
+pub unsafe extern "C" fn pam_sm_authenticate(pamh: *mut c_void, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
     run_entry(|| {
         // SAFETY: libpam guarantees `argv` is either null or points
         // to `argc` valid `*const c_char` entries. The helper
@@ -178,7 +222,19 @@ pub unsafe extern "C" fn pam_sm_authenticate(_pamh: *mut c_void, _flags: c_int, 
         let argv_strings = unsafe { collect_pam_argv(argc, argv) };
         let argv_refs: Vec<&str> = argv_strings.iter().map(String::as_str).collect();
         let cfg = Config::from_pam_argv(&argv_refs);
-        let outcome = auth::authenticate(&cfg);
+        // SAFETY: `pamh` is the live handle libpam passed us; both helpers
+        // tolerate a null handle by returning `None`.
+        let (service, user) = unsafe {
+            (
+                pam_string_item(pamh, PAM_ITEM_SERVICE),
+                pam_string_item(pamh, PAM_ITEM_USER),
+            )
+        };
+        let ctx = auth::PamContext {
+            service: service.unwrap_or_else(|| "unknown".to_string()),
+            user: user.unwrap_or_else(|| "unknown".to_string()),
+        };
+        let outcome = auth::authenticate_with_context(&cfg, &ctx);
         log_info(&format!(
             "deunlock: unlock {} reason={} peer_id={}",
             if outcome.is_success() { "success" } else { "denied" },
