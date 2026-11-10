@@ -34,6 +34,8 @@ deunlock-core = { path = "../deunlock-core" }
 # rotating-session-UUID derivation, and the `PairBackend` seam this crate's
 # `pair` module dispatches against in production. `default-features = false`
 # strips the S-003 `FakePeripheral` test double from the shipped CLI binary.
+deunlock-net = { path = "../deunlock-net" }
+rand_core = { version = "0.6", features = ["getrandom"] }
 deunlock-transport = { path = "../deunlock-transport", default-features = false }
 # HKDF-SHA256 for the app-level OOB code derivation. Pinned to the same major
 # the workspace already pulled in via `deunlock-transport` (S-010) so we share a

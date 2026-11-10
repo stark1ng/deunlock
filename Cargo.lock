@@ -754,6 +754,7 @@ dependencies = [
  "bluer",
  "clap",
  "deunlock-core",
+ "deunlock-net",
  "deunlock-presenced",
  "deunlock-transport",
  "futures",
@@ -762,6 +763,7 @@ dependencies = [
  "nix",
  "predicates",
  "rand 0.8.6",
+ "rand_core 0.6.4",
  "regex",
  "serde",
  "serde_json",
@@ -778,6 +780,7 @@ dependencies = [
 name = "deunlock-core"
 version = "0.3.0"
 dependencies = [
+ "base64",
  "blake3",
  "ed25519-dalek",
  "hex",

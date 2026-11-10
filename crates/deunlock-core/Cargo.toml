@@ -32,6 +32,7 @@ toml = "0.8"
 # S-005 bond store: same-filesystem atomic rename via `NamedTempFile::persist`.
 tempfile = "3"
 # S-005 bond store: BLAKE3 hash producing the stable peer-id.
+base64 = "0.22"
 blake3 = "1"
 # S-005 bond store: RFC3339 timestamps in `created_at`.
 time = { version = "0.3", features = ["serde", "macros", "formatting", "parsing"] }

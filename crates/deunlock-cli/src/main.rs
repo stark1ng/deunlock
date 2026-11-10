@@ -24,6 +24,7 @@ use deunlock_cli::{
     list::run_list,
     pair::{ListOpts, PairOpts, run_pair},
     pair_backend::BluerPairBackend,
+    pair_qr::{self, PairQrOpts},
     revoke::{RevokeOpts, run_revoke},
     status::{StatusOpts, run_status},
     uninstall_pam::{self, UninstallOpts, UninstallOutcome},
@@ -65,6 +66,9 @@ enum Cmd {
     /// Install the `deunlock-presenced` systemd user unit and (live mode)
     /// reload + enable + start it.
     InstallPresenced(InstallPresencedOpts),
+    /// Print a pairing QR carrying the host identity, LAN endpoint, TLS pin and
+    /// a one-time pairing secret (AUDIT-001 D-07).
+    PairQr(PairQrOpts),
     /// Inspect the unlock chain: daemon liveness, bonds file, keys file
     /// modes, BlueZ adapter, systemd user unit state, audit-log tail,
     /// and the `XDG_RUNTIME_DIR` SSH-session caveat. Emits one
@@ -103,6 +107,7 @@ fn main() -> ExitCode {
 async fn dispatch(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Pair(opts) => run_pair_cli(&opts).await,
+        Cmd::PairQr(opts) => run_pair_qr(&opts),
         Cmd::List(opts) => run_list_cli(&opts),
         Cmd::Revoke(opts) => run_revoke_cli(&opts),
         Cmd::Status(opts) => run_status_cli(&opts).await,
@@ -111,6 +116,20 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Cmd::InstallPresenced(opts) => run_install_presenced(&opts),
         Cmd::Doctor(opts) => run_doctor_cli(&opts),
     }
+}
+
+/// Print a pairing QR for this desktop.
+///
+/// Identity paths honour the same `DEUNLOCK_HOST_KEY` / `DEUNLOCK_NET_*`
+/// overrides the daemon uses, so a test install can mint a code without root.
+fn run_pair_qr(opts: &PairQrOpts) -> Result<()> {
+    let host_key = std::env::var_os("DEUNLOCK_HOST_KEY")
+        .map_or_else(|| std::path::PathBuf::from(deunlock_core::DEFAULT_HOST_KEY_PATH), std::path::PathBuf::from);
+    let cert = std::env::var_os("DEUNLOCK_NET_CERT")
+        .map_or_else(|| std::path::PathBuf::from(deunlock_net::DEFAULT_NET_CERT_PATH), std::path::PathBuf::from);
+    let key = std::env::var_os("DEUNLOCK_NET_KEY")
+        .map_or_else(|| std::path::PathBuf::from(deunlock_net::DEFAULT_NET_KEY_PATH), std::path::PathBuf::from);
+    pair_qr::run(opts, &host_key, &cert, &key)
 }
 
 /// Drive the pair flow against the real adapter.
