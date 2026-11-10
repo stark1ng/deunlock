@@ -23,8 +23,8 @@ use hkdf::Hkdf;
 use rand::{RngCore, rngs::OsRng};
 use sha2::Sha256;
 use deunlock_core::{
-    BOND_KEY_BYTES, Frame, MAC_TAG_LEN, NONCE_LEN, DEUNLOCK_WIRE_VERSION_V1, Signature, SigningKey, VerifyingKey, compute_tag, sign_frame,
-    verify_frame, verify_tag,
+    BOND_KEY_BYTES, ChallengeV2, Frame, MAC_TAG_LEN, NONCE_LEN, DEUNLOCK_WIRE_VERSION_V1, DEUNLOCK_WIRE_VERSION_V2, Signature, SigningKey,
+    VerifyingKey, compute_tag, sign_frame, verify_frame, verify_tag,
 };
 use thiserror::Error;
 
@@ -449,8 +449,129 @@ pub fn oob_code_for_bond(bond_key: Vec<u8>) -> Result<Vec<String>, MobileError> 
     ])
 }
 
+
 // ---------------------------------------------------------------------------
-// 5. session_uuid_for_bond
+// 5. parse_challenge / build_response_signature — wire v1 AND v2
+// ---------------------------------------------------------------------------
+
+/// A challenge normalized across wire versions, ready to show and to sign.
+///
+/// `sign_payload` is the exact byte string the signature must cover: for v1 the
+/// frame body, for v2 the canonical transcript. Everything else is display
+/// material plus the fields a caller may want to log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChallengeInfo {
+    /// `true` when the frame was a v2 (`DLC2`) challenge.
+    pub is_v2: bool,
+    /// PAM service the desktop is asking about (`sudo`, `gdm`, ...).
+    ///
+    /// v1 frames do not carry it, so it reads `unknown` there.
+    pub service: String,
+    /// Account the desktop is asking about; `unknown` for v1.
+    pub user: String,
+    /// `host_id` of the asking desktop (32 bytes); empty for v1.
+    pub host_id: Vec<u8>,
+    /// Request nonce (16 bytes).
+    pub nonce: Vec<u8>,
+    /// Unix seconds the desktop issued the challenge; `0` for v1.
+    pub issued_at: i64,
+    /// Bytes that must be signed to approve this challenge.
+    pub sign_payload: Vec<u8>,
+}
+
+/// Decode a challenge frame of either wire version, verify its MAC under
+/// `bond_key`, and return what the phone should display and sign.
+///
+/// This is the gate in front of the fingerprint: a frame whose MAC does not
+/// verify never reaches a signature, so a network attacker without the bond
+/// key cannot use the phone as a signing oracle (AUDIT-001 D-02).
+///
+/// # Errors
+///
+/// - [`MobileError::InvalidKey`] for a bond key that is not 32 bytes.
+/// - [`MobileError::BadFrame`] for a frame that does not decode.
+/// - [`MobileError::VerifyFailed`] when the MAC tag does not match.
+pub fn parse_challenge(bond_key: Vec<u8>, frame_bytes: Vec<u8>) -> Result<ChallengeInfo, MobileError> {
+    let bond_key_arr = bond_key_array(&bond_key)?;
+    let is_v2 = frame_bytes.first() == Some(&DEUNLOCK_WIRE_VERSION_V2);
+    if is_v2 {
+        let frame = Frame::decode_v2(&frame_bytes).map_err(|e| MobileError::BadFrame {
+            reason: format!("v2 frame decode failed: {e}"),
+        })?;
+        let challenge = ChallengeV2::from_frame(&frame).map_err(|e| MobileError::BadFrame {
+            reason: format!("challenge payload decode failed: {e}"),
+        })?;
+        if !challenge.verify(&bond_key_arr) {
+            return Err(MobileError::VerifyFailed {
+                reason: "challenge MAC did not verify under the supplied bond key".to_owned(),
+            });
+        }
+        let transcript = challenge.transcript();
+        return Ok(ChallengeInfo {
+            is_v2: true,
+            service: transcript.service().to_owned(),
+            user: transcript.user().to_owned(),
+            host_id: transcript.host_id().to_vec(),
+            nonce: transcript.nonce().to_vec(),
+            issued_at: i64::try_from(transcript.issued_at()).unwrap_or(i64::MAX),
+            sign_payload: transcript.encode(),
+        });
+    }
+
+    let frame = Frame::decode(&frame_bytes).map_err(|e| MobileError::BadFrame {
+        reason: format!("frame decode failed: {e}"),
+    })?;
+    let body = frame.body_bytes().map_err(|e| MobileError::BadFrame {
+        reason: format!("frame body encode failed: {e}"),
+    })?;
+    let mut tag_arr = [0u8; MAC_TAG_LEN];
+    tag_arr.copy_from_slice(&frame.tag);
+    if !verify_tag(&bond_key_arr, &body, &tag_arr) {
+        return Err(MobileError::VerifyFailed {
+            reason: "frame MAC tag did not verify under the supplied bond key".to_owned(),
+        });
+    }
+    Ok(ChallengeInfo {
+        is_v2: false,
+        service: "unknown".to_owned(),
+        user: "unknown".to_owned(),
+        host_id: Vec::new(),
+        nonce: frame.nonce.to_vec(),
+        issued_at: 0,
+        sign_payload: body,
+    })
+}
+
+/// Sign a challenge of either wire version and return the raw 64-byte Ed25519
+/// signature — the blob `pam_deunlock` reads back and verifies.
+///
+/// Unlike [`build_response_frame`], this returns the bare signature, which is
+/// what the daemon's `parse_signature` accepts on the response channel.
+///
+/// # Errors
+///
+/// Everything [`parse_challenge`] returns, plus [`MobileError::SignFailed`]
+/// when the foreign signer returns the wrong number of bytes.
+pub fn build_response_signature(
+    bond_key: Vec<u8>,
+    signer: Box<dyn FrameSigner>,
+    frame_bytes: Vec<u8>,
+) -> Result<Vec<u8>, MobileError> {
+    let info = parse_challenge(bond_key, frame_bytes)?;
+    let signature = signer.sign(info.sign_payload);
+    if signature.len() != ED25519_SIGNATURE_LEN {
+        return Err(MobileError::SignFailed {
+            reason: format!(
+                "foreign signer returned {} bytes, expected {ED25519_SIGNATURE_LEN}",
+                signature.len()
+            ),
+        });
+    }
+    Ok(signature)
+}
+
+// ---------------------------------------------------------------------------
+// 6. session_uuid_for_bond
 // ---------------------------------------------------------------------------
 
 /// HKDF info string for the rotating session UUID derivation. Mirrors
@@ -1226,4 +1347,64 @@ mod tests {
             );
         }
     }
+    // -----------------------------------------------------------------
+    // parse_challenge / build_response_signature (wire v1 + v2)
+    // -----------------------------------------------------------------
+
+    /// Build a v2 challenge frame the way the desktop daemon does.
+    fn v2_challenge_frame(bond_key: &[u8; BOND_KEY_BYTES]) -> (Vec<u8>, deunlock_core::AuthTranscript) {
+        let transcript = deunlock_core::AuthTranscript::new([0x5Au8; 32], "sudo", "roma", [0x11u8; NONCE_LEN], 1_700_000_000)
+            .expect("transcript");
+        let challenge = ChallengeV2::new(transcript.clone(), bond_key);
+        let frame = challenge.to_frame().expect("v2 frame");
+        let mut out = Vec::new();
+        frame.encode(&mut out).expect("encode");
+        (out, transcript)
+    }
+
+    #[test]
+    fn parse_challenge_reads_a_v2_transcript() {
+        let bond_key = [0x42u8; BOND_KEY_BYTES];
+        let (frame_bytes, transcript) = v2_challenge_frame(&bond_key);
+        let info = parse_challenge(bond_key.to_vec(), frame_bytes).expect("parse");
+        assert!(info.is_v2);
+        assert_eq!(info.service, "sudo");
+        assert_eq!(info.user, "roma");
+        assert_eq!(info.host_id, vec![0x5Au8; 32]);
+        assert_eq!(info.nonce, vec![0x11u8; NONCE_LEN]);
+        assert_eq!(info.issued_at, 1_700_000_000);
+        assert_eq!(info.sign_payload, transcript.encode(), "phone must sign the transcript");
+    }
+
+    #[test]
+    fn parse_challenge_rejects_a_v2_frame_with_the_wrong_bond_key() {
+        let bond_key = [0x42u8; BOND_KEY_BYTES];
+        let (frame_bytes, _) = v2_challenge_frame(&bond_key);
+        match parse_challenge([0x43u8; BOND_KEY_BYTES].to_vec(), frame_bytes) {
+            Err(MobileError::VerifyFailed { .. }) => {}
+            other => panic!("expected VerifyFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_signature_signs_the_transcript_not_the_frame_body() {
+        let bond_key = [0x42u8; BOND_KEY_BYTES];
+        let (frame_bytes, transcript) = v2_challenge_frame(&bond_key);
+        let (signer, captured) = new_capturing_signer(vec![0xABu8; ED25519_SIGNATURE_LEN]);
+        let signature = build_response_signature(bond_key.to_vec(), signer, frame_bytes).expect("sign");
+        assert_eq!(signature.len(), ED25519_SIGNATURE_LEN);
+        let message = captured.lock().expect("slot").clone().expect("captured");
+        assert_eq!(message, transcript.encode(), "signer must receive the transcript bytes");
+    }
+
+    #[test]
+    fn build_response_signature_refuses_a_frame_it_could_not_authenticate() {
+        let bond_key = [0x42u8; BOND_KEY_BYTES];
+        let (frame_bytes, _) = v2_challenge_frame(&bond_key);
+        let (signer, captured) = new_capturing_signer(vec![0xABu8; ED25519_SIGNATURE_LEN]);
+        let outcome = build_response_signature([0x43u8; BOND_KEY_BYTES].to_vec(), signer, frame_bytes);
+        assert!(matches!(outcome, Err(MobileError::VerifyFailed { .. })));
+        assert!(captured.lock().expect("slot").is_none(), "no signature without a verified MAC");
+    }
+
 }

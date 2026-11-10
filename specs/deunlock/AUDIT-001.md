@@ -193,3 +193,23 @@ BLAKE3(public_key)[..32]`, загрузка отказывается прини�
 - Проверено тестами: кадр `0x02` декодируется, MAC сходится с bond_key,
   транскрипт содержит ожидаемые поля, подпись над транскриптом принимается;
   подпись, выданная для `gdm`, не принимается для `sudo`.
+
+## Телефонная половина v2 (mobile crate + Kotlin)
+
+- `deunlock-mobile`: `parse_challenge(bond_key, frame)` понимает обе версии
+  провода, **проверяет MAC до всякой подписи** (закрывает D-02: без bond_key
+  телефон больше не оракул подписи) и возвращает `ChallengeInfo`
+  (`service`, `user`, `host_id`, `nonce`, `issued_at`, `sign_payload`).
+- `build_response_signature(...)` подписывает `sign_payload` (для v2 —
+  канонический транскрипт) и отдаёт сырые 64 байта, которые демон и разбирает
+  через `parse_signature`. Раньше Kotlin отправлял целый v1-фрейм, который
+  демон как подпись не принял бы — это была реальная несостыковка живого пути.
+- Kotlin: `UniffiWireSigner` вызывает `buildResponseSignature`; экран
+  подтверждения показывает `service · user` из транскрипта (для v1-кадров
+  строка не рисуется), `WireSigner.describeChallenge` — шов, который в тестах
+  возвращает пустую строку.
+- Статус проверки: Rust-часть покрыта тестами (517 в workspace). Kotlin **не
+  компилировался** — на машине не было Android SDK; SDK поставлен
+  (`/mnt/king4tb/tools/android-sdk`, platform 35, build-tools 35.0.0), но для
+  сборки APK нужны NDK, rustup-таргеты `*-linux-android`, `cargo-ndk` и
+  `uniffi-bindgen`.

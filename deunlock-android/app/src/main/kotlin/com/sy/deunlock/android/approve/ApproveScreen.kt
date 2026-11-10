@@ -150,6 +150,9 @@ public fun ApproveScreen(
     }
 
     val safeHostname = sanitizeHostname(viewModel.hostname)
+    // v2 challenges name the service and the account ("sudo · roma"); v1 frames
+    // carry neither, and the line is then omitted entirely.
+    val requestLabel = (state as? ApproveUiState.Counting)?.requestLabel.orEmpty()
     val approveEnabled = state is ApproveUiState.Counting
 
     Scaffold(
@@ -188,6 +191,16 @@ public fun ApproveScreen(
                 color = MaterialTheme.colorScheme.onBackground,
                 modifier = Modifier.semantics { testTag = ApproveScreenTestTags.HOSTNAME },
             )
+            if (requestLabel.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(SECTION_SPACING_DP))
+                Text(
+                    text = requestLabel,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
             Spacer(modifier = Modifier.height(SECTION_SPACING_DP))
             CountdownRow(state)
             Spacer(modifier = Modifier.weight(1f))

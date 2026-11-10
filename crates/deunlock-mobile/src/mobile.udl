@@ -40,6 +40,17 @@ namespace deunlock_mobile {
   [Throws=MobileError]
   bytes build_response_frame(bytes bond_key, FrameSigner signer, bytes challenge_frame_bytes);
 
+  // Decode a challenge frame of EITHER wire version, verify its MAC under
+  // bond_key, and return what the phone should display and sign. A frame whose
+  // MAC does not verify never reaches a signature (AUDIT-001 D-02).
+  [Throws=MobileError]
+  ChallengeInfo parse_challenge(bytes bond_key, bytes frame_bytes);
+
+  // Sign a challenge of either wire version and return the raw 64-byte Ed25519
+  // signature — the blob the desktop's pam_deunlock verifies.
+  [Throws=MobileError]
+  bytes build_response_signature(bytes bond_key, FrameSigner signer, bytes frame_bytes);
+
   // Derive the 4-word emoji-prefixed OOB code for `bond_key`. Mirrors
   // `crates/deunlock-cli/src/oob.rs::oob_code_for_bond`.
   [Throws=MobileError]
@@ -65,6 +76,17 @@ interface MobileError {
   BadFrame(string reason);
   VerifyFailed(string reason);
   SignFailed(string reason);
+};
+
+// A challenge normalized across wire versions (see parse_challenge).
+dictionary ChallengeInfo {
+  boolean is_v2;
+  string service;
+  string user;
+  bytes host_id;
+  bytes nonce;
+  i64 issued_at;
+  bytes sign_payload;
 };
 
 // Parsed invite record.

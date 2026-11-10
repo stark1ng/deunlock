@@ -64,7 +64,11 @@ public sealed class DenialReason {
  */
 public sealed class ApproveUiState {
     public data object Idle : ApproveUiState()
-    public data class Counting(val remainingSeconds: Int) : ApproveUiState()
+    public data class Counting(
+        val remainingSeconds: Int,
+        /** `service · user` the desktop is asking about; empty when unknown. */
+        val requestLabel: String = "",
+    ) : ApproveUiState()
     public data object AwaitingBiometric : ApproveUiState()
     public data object Signing : ApproveUiState()
 
@@ -113,6 +117,14 @@ public interface WireSigner {
      * [WireSignResult.Failure].
      */
     public suspend fun signWire(bondKey: ByteArray, frameBytes: ByteArray): WireSignResult
+
+    /**
+     * Human-readable description of what [frameBytes] asks for, e.g.
+     * `"sudo · roma"`. Returns an empty string when the challenge does not
+     * carry the context (v1 frames) or cannot be parsed — the screen then
+     * shows only the host name. Implementations MUST NOT throw.
+     */
+    public fun describeChallenge(frameBytes: ByteArray): String = ""
 }
 
 /** Typed result of a [WireSigner.signWire] call. */
@@ -188,6 +200,12 @@ public class ApproveViewModel(
     private val keystoreAlias: String = DEFAULT_KEYSTORE_GATE_ALIAS,
 ) : ViewModel() {
 
+    /**
+     * What this challenge asks for (`sudo · roma`), parsed once from the frame.
+     * Empty for v1 frames, which carry no service or account.
+     */
+    private val requestLabel: String = wireSigner.describeChallenge(challengeFrame)
+
     private val _uiState: MutableStateFlow<ApproveUiState> = MutableStateFlow(ApproveUiState.Idle)
     public val uiState: StateFlow<ApproveUiState> = _uiState.asStateFlow()
 
@@ -224,7 +242,7 @@ public class ApproveViewModel(
             return
         }
         val initialSeconds = millisToSeconds(timeoutMillis)
-        _uiState.value = ApproveUiState.Counting(initialSeconds)
+        _uiState.value = ApproveUiState.Counting(initialSeconds, requestLabel)
         countdownJob = viewModelScope.launch(ioDispatcher) {
             runCountdown()
         }
@@ -252,7 +270,7 @@ public class ApproveViewModel(
                 onTimeout()
                 return
             }
-            _uiState.value = ApproveUiState.Counting(millisToSeconds(remainingMillis))
+            _uiState.value = ApproveUiState.Counting(millisToSeconds(remainingMillis), requestLabel)
         }
     }
 

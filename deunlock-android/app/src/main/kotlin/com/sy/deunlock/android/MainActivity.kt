@@ -835,7 +835,7 @@ private fun ApproveRoute(
                 activity = activity,
                 hostname = payload.hostname,
             ),
-            wireSigner = UniffiWireSigner(frameSigner = frameSigner),
+            wireSigner = UniffiWireSigner(frameSigner = frameSigner, bondKey = bondKey),
             responseSender = GattResponseSender(peerId = payload.peerId),
         )
     }

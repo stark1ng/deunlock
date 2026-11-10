@@ -61,8 +61,8 @@ pub mod implementation;
 pub use implementation::{
     ED25519_SECRET_KEY_LEN, ED25519_SIGNATURE_LEN, FrameSigner, HKDF_INFO_OOB_V1, HKDF_INFO_SESSION_V1, INVITE_PUBKEY_LEN,
     INVITE_QUERY_KEY_HOST, INVITE_QUERY_KEY_PUBKEY, INVITE_URI_HOST_PATH, INVITE_URI_SCHEME, Invite, MOBILE_BOND_KEY_LEN, MobileError,
-    OOB_WORD_COUNT, OOB_WORDS, SESSION_UUID_BYTES_MOBILE, build_response_frame, oob_code_for_bond, parse_invite_uri, session_uuid_for_bond,
-    sign_challenge_response, verify_challenge_frame,
+    OOB_WORD_COUNT, OOB_WORDS, SESSION_UUID_BYTES_MOBILE, ChallengeInfo, build_response_frame, build_response_signature, oob_code_for_bond,
+    parse_challenge, parse_invite_uri, session_uuid_for_bond, sign_challenge_response, verify_challenge_frame,
 };
 
 /// Library version. Surfaced through UniFFI so the Kotlin caller can log
@@ -81,7 +81,9 @@ mod tests {
 
     #[test]
     fn version_is_non_empty() {
-        assert!(!VERSION.is_empty());
+        // `!VERSION.is_empty()` trips clippy::const_is_empty; the version
+        // string is a compile-time constant that is always shaped `x.y.z`.
+        assert!(VERSION.split('.').count() >= 2, "VERSION must look like x.y.z");
     }
 
     #[test]

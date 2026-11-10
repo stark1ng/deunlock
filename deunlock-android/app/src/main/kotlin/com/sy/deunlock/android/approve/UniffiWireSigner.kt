@@ -23,13 +23,37 @@ import uniffi.deunlock_mobile.FrameSigner
  * test wiring injects a fake that returns a canned signature without
  * touching the Keystore.
  */
-public class UniffiWireSigner(private val frameSigner: FrameSigner) : WireSigner {
+public class UniffiWireSigner(
+    private val frameSigner: FrameSigner,
+    private val bondKey: ByteArray = ByteArray(0),
+) : WireSigner {
     override suspend fun signWire(bondKey: ByteArray, frameBytes: ByteArray): WireSignResult {
         return try {
-            val encoded = uniffi.deunlock_mobile.buildResponseFrame(bondKey, frameSigner, frameBytes)
-            WireSignResult.Ok(encoded)
+            // `buildResponseSignature` verifies the challenge MAC under the bond
+            // key, signs the canonical payload (v1 frame body or v2 transcript)
+            // and returns the raw 64-byte signature the daemon reads back.
+            // Signing is unreachable for a frame whose MAC does not verify
+            // (AUDIT-001 D-02).
+            val signature = uniffi.deunlock_mobile.buildResponseSignature(bondKey, frameSigner, frameBytes)
+            WireSignResult.Ok(signature)
         } catch (t: Throwable) {
             WireSignResult.Failure(t.message ?: t::class.java.simpleName)
+        }
+    }
+
+    override fun describeChallenge(frameBytes: ByteArray): String {
+        if (bondKey.isEmpty()) {
+            return ""
+        }
+        return try {
+            val info = uniffi.deunlock_mobile.parseChallenge(bondKey, frameBytes)
+            if (!info.isV2 || info.service.isBlank() || info.service == "unknown") {
+                ""
+            } else {
+                "${info.service} \u00b7 ${info.user}"
+            }
+        } catch (t: Throwable) {
+            ""
         }
     }
 }
