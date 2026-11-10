@@ -13,6 +13,7 @@ members = [
     "crates/deunlock-pam",
     "crates/deunlock-cli",
     "crates/deunlock-mobile",
+    "crates/deunlock-net",
     "crates/deunlock-presenced",
 ]
 # The `crates/deunlock-core/fuzz` crate is a stand-alone libFuzzer harness; it is
