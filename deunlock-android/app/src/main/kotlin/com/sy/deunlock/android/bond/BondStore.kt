@@ -55,6 +55,15 @@ internal object BondKeys {
     const val BOND_KEY_HEX: String = "bond_key_hex"
     const val KEYSTORE_ALIAS: String = "keystore_alias"
     const val PHONE_PUBKEY_HEX: String = "phone_pubkey_hex"
+
+    /**
+     * Revocation tombstone keys. Optional on read — a record written before the
+     * tombstone existed simply has no pending revocation — so the schema version
+     * does not move: an older build ignores them, a newer one treats their
+     * absence as "not revoked".
+     */
+    const val REVOKE_PENDING: String = "revoke_pending"
+    const val REVOKE_DEADLINE_MS: String = "revoke_deadline_ms"
 }
 
 /**
@@ -109,6 +118,10 @@ public class BondStore(private val storageDir: File) {
 public fun parseBondRecord(body: String): BondRecord {
     val fields: MutableMap<String, String> = HashMap()
     val integerFields: MutableMap<String, Int> = HashMap()
+    // Timestamps do not fit in an Int, and a deadline is a timestamp: keep a
+    // long map so the parser stays strict (unparseable values still throw)
+    // without forcing callers to quote numbers.
+    val longFields: MutableMap<String, Long> = HashMap()
     for (rawLine in body.lineSequence()) {
         val line = rawLine.trim()
         if (line.isEmpty()) continue
@@ -126,8 +139,12 @@ public fun parseBondRecord(body: String): BondRecord {
         if (value.startsWith(QUOTE) && value.endsWith(QUOTE) && value.length >= MIN_QUOTED_LEN) {
             fields[key] = value.substring(1, value.length - 1)
         } else {
-            val parsed = value.toIntOrNull() ?: throw BondParseError.MalformedLine(line)
-            integerFields[key] = parsed
+            val asInt = value.toIntOrNull()
+            if (asInt != null) {
+                integerFields[key] = asInt
+            } else {
+                longFields[key] = value.toLongOrNull() ?: throw BondParseError.MalformedLine(line)
+            }
         }
     }
     val schemaVersion = integerFields[BondKeys.SCHEMA_VERSION]
@@ -149,6 +166,10 @@ public fun parseBondRecord(body: String): BondRecord {
         bondKey = bondKey,
         keystoreAlias = keystoreAlias,
         phonePubkey = pubkey,
+        revokePending = integerFields[BondKeys.REVOKE_PENDING] == 1,
+        revokeDeadlineMs = longFields[BondKeys.REVOKE_DEADLINE_MS]
+            ?: integerFields[BondKeys.REVOKE_DEADLINE_MS]?.toLong()
+            ?: 0L,
     )
 }
 
@@ -162,6 +183,13 @@ public fun serializeBondRecord(record: BondRecord): String {
     sb.append(BondKeys.BOND_KEY_HEX).appendQuoted(encodeHex(record.bondKey))
     sb.append(BondKeys.KEYSTORE_ALIAS).appendQuoted(record.keystoreAlias)
     sb.append(BondKeys.PHONE_PUBKEY_HEX).appendQuoted(encodeHex(record.phonePubkey))
+    if (record.revokePending) {
+        sb.append(BondKeys.REVOKE_PENDING).append(SERIALIZE_INT_SEP).append(1).append(NEWLINE)
+        if (record.revokeDeadlineMs > 0) {
+            sb.append(BondKeys.REVOKE_DEADLINE_MS).append(SERIALIZE_INT_SEP)
+                .append(record.revokeDeadlineMs).append(NEWLINE)
+        }
+    }
     return sb.toString()
 }
 

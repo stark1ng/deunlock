@@ -42,6 +42,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::presence::{PresenceStore, STALE_DEADLINE_MS};
 use crate::audit::{AuditLog, AuditRecord};
 
 /// Number of seconds in one wall-clock minute. Named so the
@@ -499,6 +500,11 @@ pub struct Orchestrator {
     audit_log: TokioMutex<Option<AuditLog>>,
     /// `tokio::time::Instant` of the next minute-tick.
     start: Instant,
+    /// Persisted "last time this peer actually answered". Drives the shortened
+    /// deadline for peers that are no longer there — a bond outlives the phone,
+    /// and a stale bond otherwise costs the full human-scale deadline on every
+    /// authentication. See [`crate::presence`].
+    presence: TokioMutex<PresenceStore>,
 }
 
 /// Per-peer in-memory record. S-006 extends the S-005 layout with
@@ -632,6 +638,11 @@ impl Orchestrator {
             map.insert(bond.peer_id.clone(), PeerEntry::new(bond_key, Some(bond.pubkey)));
         }
         let (reload_tx, reload_rx) = mpsc::channel(RELOAD_CHANNEL_CAPACITY);
+        // Presence lives beside the bond store, so it is per-install and not
+        // per-daemon-process: a restart must not make a dead bond look fresh.
+        let presence = TokioMutex::new(PresenceStore::load(
+            bonds_file.parent().unwrap_or_else(|| std::path::Path::new(".")),
+        ));
         Self {
             peripheral,
             transport_ready: AtomicBool::new(false),
@@ -643,6 +654,7 @@ impl Orchestrator {
             reload_rx: tokio::sync::Mutex::new(Some(reload_rx)),
             audit_log: TokioMutex::new(audit_log),
             start,
+            presence,
         }
     }
 
@@ -779,6 +791,49 @@ impl Orchestrator {
         guard.iter().map(|(id, entry)| (id.clone(), entry.bond_key)).collect()
     }
 
+    /// Deadline to actually wait for this peer.
+    ///
+    /// A bond outlives the phone — revoked, lost, wiped — and `pam_deunlock.so`
+    /// installs as `sufficient`, so the phone that is not there costs the full
+    /// human-scale deadline on *every* authentication before the password path
+    /// runs. A peer that has not answered for a day gets a short deadline
+    /// instead: still long enough for a phone that is merely slow, short enough
+    /// that a phone that is gone does not hold up `sudo`. Never-seen peers keep
+    /// the requested deadline, so the first unlock after a reboot is unaffected.
+    async fn effective_deadline(&self, peer_id: &str, requested: StdDuration) -> StdDuration {
+        let presence = self.presence.lock().await;
+        if !presence.is_stale(peer_id, crate::presence::now_ms()) {
+            return requested;
+        }
+        let stale = StdDuration::from_millis(STALE_DEADLINE_MS);
+        if requested <= stale {
+            return requested;
+        }
+        tracing::info!(
+            peer_id,
+            requested_ms = u64::try_from(requested.as_millis()).unwrap_or(u64::MAX),
+            applied_ms = STALE_DEADLINE_MS,
+            "peer has not answered in a day; shortening the challenge deadline"
+        );
+        stale
+    }
+
+    /// Test-only view of the deadline the orchestrator would apply.
+    ///
+    /// The applied value is otherwise invisible: `ChallengeOutcome::TimedOut`
+    /// carries no payload, and proving the shortening by waiting 25 s against
+    /// 3 s makes for a test nobody runs.
+    #[doc(hidden)]
+    pub async fn effective_deadline_for_test(&self, peer_id: &str, requested: StdDuration) -> StdDuration {
+        self.effective_deadline(peer_id, requested).await
+    }
+
+    /// Record that the phone answered, and persist it.
+    async fn mark_presence(&self, peer_id: &str) {
+        let mut presence = self.presence.lock().await;
+        presence.mark_now(peer_id);
+    }
+
     /// Retire a bond that the phone has revoked.
     ///
     /// Three things must happen together or the two sides disagree again: the
@@ -805,6 +860,7 @@ impl Orchestrator {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => tracing::warn!(path = %key_path.display(), error = %err, "bond key removal failed"),
         }
+        self.presence.lock().await.forget(peer_id);
         self.run_reload(ReloadTrigger::Revoked).await;
     }
 
@@ -841,10 +897,18 @@ impl Orchestrator {
         let peers_before = self.peers.lock().await.len();
         for peer_id in &to_remove {
             self.do_remove_peer(peer_id).await;
+            self.presence.lock().await.forget(peer_id);
         }
         for peer_id in &to_add {
             if let Some(key) = new_set.get(peer_id) {
                 self.do_add_peer(store, peer_id, key).await;
+                // A peer that appears here has just been paired, so the phone is
+                // in hand: start its presence clock now rather than leaving it
+                // unknown (only a pair trigger is a claim about contact — a
+                // SIGHUP or inotify reload of an old file is not).
+                if matches!(trigger, ReloadTrigger::Pair) {
+                    self.presence.lock().await.mark_now(peer_id);
+                }
             }
         }
         let peers_after = self.peers.lock().await.len();
@@ -975,6 +1039,7 @@ impl Orchestrator {
                 reason: format!("nonce rng: {err}"),
             });
         }
+        let deadline = self.effective_deadline(peer_id, deadline).await;
         let outcome = self.run_challenge(peer_id, nonce, deadline, &peer_state, t_start_ms, ChallengeSpec::V1).await;
         drop(permit);
         outcome
@@ -1005,6 +1070,7 @@ impl Orchestrator {
             }
         };
         stamp_liveness(&peer_state.liveness, SystemTime::now()).await;
+        let deadline = self.effective_deadline(peer_id, deadline).await;
         let outcome = self.run_challenge(peer_id, nonce, deadline, &peer_state, t_start_ms, ChallengeSpec::V1).await;
         drop(permit);
         outcome
@@ -1045,6 +1111,7 @@ impl Orchestrator {
             }
         };
         stamp_liveness(&peer_state.liveness, SystemTime::now()).await;
+        let deadline = self.effective_deadline(peer_id, deadline).await;
         let outcome = self
             .run_challenge(
                 peer_id,
@@ -1173,6 +1240,11 @@ impl Orchestrator {
                 return outcome;
             }
         };
+        // Any bytes from the phone prove it is there and answering, whatever
+        // they say — that is what keeps the deadline human-scale for a peer
+        // that is present and shortens it for one that is gone.
+        self.mark_presence(peer_id).await;
+
         // A revocation travels on the same characteristic as a signature,
         // because that is the only channel the phone has (AUDIT-001 D-14). It is
         // authenticated under the bond key we are about to delete, so a stranger
@@ -1348,6 +1420,8 @@ impl Orchestrator {
         let now = SystemTime::now();
         let minute = minute_index(now);
         let guard = self.peers.lock().await;
+        let presence = self.presence.lock().await;
+        let presence_now = crate::presence::now_ms();
         let mut rows: Vec<crate::rpc::PeerStatus> = Vec::with_capacity(guard.len());
         for (peer_id, entry) in guard.iter() {
             let liveness = entry.liveness.lock().await.clone();
@@ -1359,6 +1433,8 @@ impl Orchestrator {
                 last_connect_ms_ago: ms_since(now, liveness.last_connect_at),
                 current_session_uuid: Uuid::from_bytes(uuid_bytes),
                 in_flight_challenges: in_flight,
+                last_seen_ms_ago: presence.last_seen_ms_ago(peer_id, presence_now),
+                stale: presence.is_stale(peer_id, presence_now),
             });
         }
         rows

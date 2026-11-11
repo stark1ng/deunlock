@@ -137,6 +137,19 @@ const val HOME_REVOKE_BUTTON_TAG: String = "deunlock.home.revoke"
 /** Test tag attached to the "?" diagnostic button on the home route. */
 const val HOME_DIAGNOSTIC_BUTTON_TAG: String = "deunlock.home.diagnostic"
 
+/**
+ * How long a revocation tombstone is carried, in milliseconds.
+ *
+ * Seven days: long enough that a phone revoked away from the computer delivers
+ * the frame on the next contact, short enough that a tombstone to a desktop that
+ * no longer exists does not sit on the phone forever. The key it holds is the
+ * symmetric MAC key only - the Keystore signing key is destroyed at revoke time,
+ * so nothing can be approved in the meantime (AUDIT-001 D-14).
+ */
+internal const val REVOKE_LOG_TAG: String = "deunlock.revoke"
+
+internal const val REVOKE_TOMBSTONE_TTL_MS: Long = 7L * 24L * 60L * 60L * 1_000L
+
 // Bond store filename comes from `BondStore.BOND_RECORD_FILE_NAME` so this
 // route never duplicates the literal.
 
@@ -540,7 +553,7 @@ class MainActivity : FragmentActivity() {
             )
         }
         approvePayload.value = parseApprovePayload(intent)
-        val record = runCatching { loadPersistedBond(filesDir) }.getOrNull()
+        val record = expireRevocationTombstone(runCatching { loadPersistedBond(filesDir) }.getOrNull())
         bondRecord.value = record
         // Always request BLE runtime permissions on activity start, not just
         // when a bond exists. The pair flow's `BluetoothDevice.createBond()`
@@ -632,13 +645,48 @@ class MainActivity : FragmentActivity() {
      */
     internal fun onBondRevokeTapped() {
         val record = bondRecord.value ?: return
-        val bondFile = java.io.File(filesDir, BOND_RECORD_FILE_NAME)
-        runCatching { bondFile.delete() }
-        runCatching {
+        // Destroy the signing key first, and refuse to pretend otherwise if that
+        // fails: a tombstone that still holds a usable Keystore alias would be
+        // worse than no revoke at all, because it looks done.
+        val destroyed = runCatching {
             val ks = java.security.KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
             if (ks.containsAlias(record.keystoreAlias)) ks.deleteEntry(record.keystoreAlias)
+            true
+        }.getOrElse {
+            Log.w(REVOKE_LOG_TAG, "revoke: keystore delete failed; keeping the bond as it was", it)
+            false
         }
-        bondRecord.value = null
+        if (!destroyed) return
+
+        // Keep the record as a tombstone so the desktop can be told the bond is
+        // gone - the phone cannot open a socket to it, so the revocation rides
+        // the next challenge on the response characteristic (AUDIT-001 D-14).
+        val tombstone = record.copy(
+            revokePending = true,
+            revokeDeadlineMs = System.currentTimeMillis() + REVOKE_TOMBSTONE_TTL_MS,
+        )
+        val persisted = runCatching { BondStore(filesDir).save(tombstone) }.isSuccess
+        if (!persisted) {
+            Log.w(REVOKE_LOG_TAG, "revoke: could not persist tombstone; deleting the record instead")
+            runCatching { java.io.File(filesDir, BOND_RECORD_FILE_NAME).delete() }
+        }
+        bondRecord.value = if (persisted) tombstone else null
+    }
+
+    /**
+     * Drop a tombstone that has outlived its usefulness.
+     *
+     * After [REVOKE_TOMBSTONE_TTL_MS] the phone stops carrying the revocation:
+     * the desktop is left to notice by itself that the peer never answers, and
+     * the phone stops holding a key for a bond the operator retired days ago.
+     */
+    private fun expireRevocationTombstone(record: BondRecord?): BondRecord? {
+        if (record == null || !record.revokePending) return record
+        if (record.revokeDeadlineMs == 0L) return record
+        if (System.currentTimeMillis() <= record.revokeDeadlineMs) return record
+        Log.i(REVOKE_LOG_TAG, "revoke: tombstone expired; dropping the record")
+        runCatching { java.io.File(filesDir, BOND_RECORD_FILE_NAME).delete() }
+        return null
     }
 }
 
@@ -903,7 +951,10 @@ private fun HomeRoute(
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            if (bondRecord == null) {
+            // A tombstone is not a pairing: the operator revoked it, and the
+            // only thing left is a pending message to the desktop. Showing it as
+            // paired would tell the operator their phone can still unlock.
+            if (bondRecord == null || bondRecord.revokePending) {
                 UnpairedHomeBody(onPairTapped = onPairTapped)
             } else {
                 PairedHomeBody(

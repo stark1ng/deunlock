@@ -108,6 +108,8 @@ fn peer_row(peer_id: &str) -> PeerStatus {
         last_connect_ms_ago: Some(TEST_LAST_CONNECT_MS),
         current_session_uuid: uuid::Uuid::from_bytes([0xd9; 16]),
         in_flight_challenges: 0,
+        last_seen_ms_ago: None,
+        stale: false,
     }
 }
 

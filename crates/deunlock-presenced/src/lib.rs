@@ -13,12 +13,14 @@ pub mod audit;
 pub mod composite;
 pub mod lock;
 pub mod orchestrator;
+pub mod presence;
 pub mod rpc;
 pub mod runtime;
 pub mod server;
 
 pub use audit::{AUDIT_FIELD_SEPARATOR, AUDIT_FSYNC_EVERY, AUDIT_LOG_FILE_MODE, AuditLog, AuditRecord};
 pub use lock::{LockError, PidFileLock};
+pub use presence::{PresenceStore, STALE_AFTER_MS, STALE_DEADLINE_MS};
 pub use orchestrator::{
     BUSY_QUEUE_DEADLINE, BUSY_REASON, ChallengeOutcome, DEFAULT_AUTH_TIMEOUT, NONCE_BYTES, NONCE_LRU_CAP, NonceCache,
     OUTCOME_REASON_BAD_SIGNATURE, OUTCOME_REASON_BUSY, OUTCOME_REASON_DENIED, OUTCOME_REASON_OK, OUTCOME_REASON_REPLAY,

@@ -32,6 +32,26 @@ public data class BondRecord(
     val bondKey: ByteArray,
     val keystoreAlias: String,
     val phonePubkey: ByteArray,
+    /**
+     * The operator revoked this bond on the phone, but the desktop has not been
+     * told yet: it is out of range, or the phone was revoked somewhere the
+     * computer was not.
+     *
+     * A revocation used to be one-sided — the phone forgot the bond, the desktop
+     * kept challenging a device that no longer held the key, and because pair
+     * mode is exclusive to "no bonds" it also stopped advertising itself as
+     * pairable (AUDIT-001 D-14). The fix is a tombstone: the Keystore signing
+     * key is destroyed immediately, so nothing can ever be approved again, while
+     * the record and its MAC key survive just long enough to carry the
+     * revocation frame to the desktop on the next contact.
+     */
+    val revokePending: Boolean = false,
+    /**
+     * When the tombstone stops being worth carrying, as Unix epoch millis.
+     * `0` when [revokePending] is false. After this, the record is deleted and
+     * the desktop is expected to notice by itself (a peer that never answers).
+     */
+    val revokeDeadlineMs: Long = 0,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -39,6 +59,8 @@ public data class BondRecord(
         return peerId == other.peerId &&
             hostName == other.hostName &&
             bondKey.contentEquals(other.bondKey) &&
+            revokePending == other.revokePending &&
+            revokeDeadlineMs == other.revokeDeadlineMs &&
             keystoreAlias == other.keystoreAlias &&
             phonePubkey.contentEquals(other.phonePubkey)
     }
@@ -47,6 +69,8 @@ public data class BondRecord(
         var result = peerId.hashCode()
         result = 31 * result + hostName.hashCode()
         result = 31 * result + bondKey.contentHashCode()
+        result = 31 * result + revokePending.hashCode()
+        result = 31 * result + revokeDeadlineMs.hashCode()
         result = 31 * result + keystoreAlias.hashCode()
         result = 31 * result + phonePubkey.contentHashCode()
         return result

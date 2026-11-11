@@ -560,3 +560,59 @@ needs a decision rather than a guess:
 Until one is chosen, the operator-facing path is `deunlock revoke <peer>` on the
 desktop: it marks the bond `Revoked`, the reload drops the peer, and pair mode
 returns — verified by `compute_new_set` filtering `is_revoked()`.
+
+### D-14 — phone half: the tombstone
+
+The desktop side landed first (the `DLR1` frame, verified under the bond key,
+dropping record + key file + live peer). The phone half needed a decision, and
+the decision was: **destroy what grants access, keep what delivers the message**.
+
+`onBondRevokeTapped` now deletes the Keystore entry *first* and only then writes
+the tombstone. If the delete fails, the record is left exactly as it was — a
+tombstone holding a live alias would be worse than no revoke at all, because it
+looks finished while the phone can still approve.
+
+What survives is the record's symmetric MAC key, which cannot sign an approval.
+What does not survive is the Ed25519 private key, so after the tap there is no
+cryptographic way for this phone to authorize anything for that desktop. The
+home screen shows an unpaired device — the operator sees the effect immediately,
+not seven days later.
+
+Delivery rides the next challenge: when the GATT client reports one, the service
+notices `revokePending` and answers with the revoke frame instead of opening the
+biometric prompt. A successful write clears the tombstone; a failed one keeps it
+and retries on the next contact. The desktop, in turn, verifies the frame,
+deletes its half and reports `bond-revoked`.
+
+Bounds, because "keep it just in case" is how secrets outlive intent:
+
+* the tombstone carries `revoke_deadline_ms = now + 7 days`; past that it is
+  dropped and the phone stops holding a key for a bond the operator retired.
+* the on-disk schema did not move. The keys are optional on read, so an older
+  build ignores them and a newer one reads their absence as "not revoked".
+* the parser gained a long map: a millisecond deadline does not fit in an Int,
+  and widening the parser was cheaper — and stricter — than quoting numbers.
+
+Residual, and now covered by the staleness rule: a tombstone that expires
+undelivered leaves a bond on the desktop that nothing will ever answer.
+
+### The staleness rule (desktop, independent of revocation)
+
+A bond outlives the phone in more ways than revocation: lost, wiped, factory
+reset. `pam_deunlock.so` installs as `sufficient`, so a dead bond costs the full
+human-scale deadline (25 s) **before** the password prompt, on every
+authentication, indefinitely. Measured on the real phone: an approved round-trip
+is ~4 s.
+
+`PresenceStore` persists one line per peer — when it last *answered* (a
+signature, a denial, or a revocation; a challenge that gets no reply is not an
+answer) — beside the bond store, so a daemon restart does not make a dead bond
+look fresh. A peer that has not answered for a day gets a 3 s deadline instead of
+whatever the caller asked for. Never-seen peers keep the requested deadline:
+never-seen is indistinguishable from "paired, and the daemon just restarted",
+and shortening it would break the first legitimate unlock after a reboot.
+
+The rule never deletes a bond. Discarding key material is a security decision,
+and the daemon is not the right place to make one unattended; it only stops
+paying for a peer that is not there. `deunlock status` prints `last_seen` and a
+`live`/`stale` column so the operator can see why a machine behaves this way.

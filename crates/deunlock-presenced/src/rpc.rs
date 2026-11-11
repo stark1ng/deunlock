@@ -157,6 +157,14 @@ pub struct PeerStatus {
     /// Count of in-flight challenges. Bounded to `{0, 1}` by SPEC
     /// §3 scope item #7 (per-peer `Semaphore(1)`).
     pub in_flight_challenges: u32,
+    /// Milliseconds since this peer last answered a challenge (any answer —
+    /// signature, denial, or revocation). Persisted across daemon restarts;
+    /// `None` when the peer has never answered.
+    pub last_seen_ms_ago: Option<u64>,
+    /// True when the peer has answered before, but not for a day. Such a peer
+    /// gets a shortened challenge deadline: it is most likely a bond to a phone
+    /// that is gone (revoked, lost, or wiped), and it must not hold up `sudo`.
+    pub stale: bool,
 }
 
 /// Errors the framing layer can surface to callers. All variants
@@ -459,6 +467,8 @@ mod tests {
                 last_connect_ms_ago: None,
                 current_session_uuid: uuid::Uuid::from_bytes([0xab; 16]),
                 in_flight_challenges: 1,
+                last_seen_ms_ago: None,
+                stale: false,
             }],
             started_at: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         };

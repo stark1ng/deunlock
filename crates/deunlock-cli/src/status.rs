@@ -591,15 +591,17 @@ pub fn write_daemon_section(writer: &mut dyn Write, report: &CliStatusReport) ->
             writeln!(writer, "daemon=up started_at={ts}")?;
             writeln!(
                 writer,
-                "peer_id                                                              last_challenge  last_connect    uuid      in_flight"
+                "peer_id                                                              last_challenge  last_connect    last_seen       state     uuid      in_flight"
             )?;
             for peer in peers {
                 writeln!(
                     writer,
-                    "{:<68}  {:<14}  {:<14}  {:<8}  {}",
+                    "{:<68}  {:<14}  {:<14}  {:<14}  {:<8}  {:<8}  {}",
                     peer.peer_id,
                     format_ms_ago(peer.last_challenge_ms_ago),
                     format_ms_ago(peer.last_connect_ms_ago),
+                    format_ms_ago(peer.last_seen_ms_ago),
+                    if peer.stale { "stale" } else { "live" },
                     short_uuid_hex(&peer.current_session_uuid),
                     peer.in_flight_challenges,
                 )?;
