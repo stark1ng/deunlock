@@ -616,3 +616,42 @@ The rule never deletes a bond. Discarding key material is a security decision,
 and the daemon is not the right place to make one unattended; it only stops
 paying for a peer that is not there. `deunlock status` prints `last_seen` and a
 `live`/`stale` column so the operator can see why a machine behaves this way.
+
+### D-15 (high) — two challenge factories, and the revocation was in one
+
+The phone half of D-14 shipped and did nothing on the real device. `revoke` wrote
+the tombstone, the home screen went unpaired, the desktop challenged — and the
+phone opened the biometric prompt anyway, then let the deadline expire. Nobody
+was wrong about the protocol: the tombstone was on disk and correct, and the
+daemon never received a single byte.
+
+Cause: the app installs `gattClientFactory` **twice**. The service installs a
+default on start; `MainActivity.installPersistentClientFactory` replaces it on
+launch. The revocation branch was added to the service's copy, so the factory
+that actually ran — the activity's — went straight to `signingPayloadFor` and
+`launchApprovalActivity`. Two wirings of the same callback is the defect; the
+missing branch was only its symptom.
+
+Both factories now call one entry point, `DeUnlockCompanionService.handleChallenge`,
+which decides between the revocation frame and the approval prompt and cannot be
+half-updated: a change to the decision lands in both call sites because there is
+only one decision.
+
+Verified on the device after the fix:
+
+```
+11:31:52.948 I/deunlock.bg: revoke: delivered to the desktop peer=04:EA:56:C2:0E:51; tombstone cleared
+11:31:53.786 WARN phone revoked its bond; dropping the desktop half
+11:31:53.790 INFO bond record removed
+11:31:53.790 INFO bond key file removed
+11:31:53.791 INFO reload trigger=revoked peers_before=1 peers_after=0
+11:31:53.801 INFO tx outcome=bond-revoked
+```
+
+`bonds.toml` drops to zero bonds, `keys/` is empty, and `pamtester` fails with
+`PAM_AUTHINFO_UNAVAIL` — the password path, as designed, not a silent hang.
+
+The rotation tick also logs the pair-mode transition now
+(`advertising in pair mode: no bonds, pair service discoverable`). It is the
+question an operator asks immediately after a revoke — "can the phone find this
+computer again?" — and at zero peers the tick had nothing else to say.

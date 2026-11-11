@@ -415,25 +415,7 @@ public class DeUnlockCompanionService : Service() {
                 peerId = bond.peerId,
                 deviceMac = bond.peerId,
                 onChallenge = { peerId, frameBytes ->
-                    // A revoked bond still has to reach the desktop, and this is
-                    // the only moment it can: the phone cannot open a socket, so
-                    // the revocation rides the challenge it is being asked to
-                    // answer. Answering it with the revoke frame is also the
-                    // honest reply - this phone will never approve for that
-                    // desktop again (AUDIT-001 D-14).
-                    val signingPayload = if (deliverPendingRevoke(peerId)) {
-                        null
-                    } else {
-                        signingPayloadFor(peerId, frameBytes)
-                    }
-                    if (signingPayload == null) {
-                        Log.w(
-                            DEUNLOCK_BG_LOG_TAG,
-                            "challenge dropped: no signing payload peer=$peerId (unknown bond, bad MAC, or unsupported wire version)",
-                        )
-                    } else {
-                        launchApprovalActivity(appContext, peerId, signingPayload)
-                    }
+                    handleChallenge(appContext, peerId, frameBytes)
                 },
             )
             PersistentGattClientRegistry.put(bond.peerId, client)
@@ -521,44 +503,6 @@ public class DeUnlockCompanionService : Service() {
             DEUNLOCK_BG_LOG_TAG,
             "ensureDefaultCompanionSeams: installed missing seams (MainActivity had not yet)",
         )
-    }
-
-    /**
-     * Tell the desktop that this bond was revoked, if a tombstone is pending.
-     *
-     * Returns true when the frame was written, in which case the challenge has
-     * been answered (the desktop verifies it, deletes its half and reports
-     * `bond-revoked`) and the caller must not open the approval UI. Returns
-     * false when there is no tombstone, or when delivery failed — in which case
-     * the tombstone stays and the next contact tries again.
-     */
-    private fun deliverPendingRevoke(peerId: String): Boolean {
-        val record = runCatching { loadPersistedBond(filesDir) }.getOrNull() ?: return false
-        if (!record.revokePending || record.peerId != peerId) return false
-        if (record.revokeDeadlineMs != 0L && System.currentTimeMillis() > record.revokeDeadlineMs) {
-            Log.i(DEUNLOCK_BG_LOG_TAG, "revoke: tombstone expired undelivered; dropping peer=$peerId")
-            runCatching { java.io.File(filesDir, BOND_RECORD_FILE_NAME).delete() }
-            return false
-        }
-        val frame = runCatching {
-            uniffi.deunlock_mobile.buildRevoke(record.bondKey, System.currentTimeMillis().toULong())
-        }.getOrElse {
-            Log.w(DEUNLOCK_BG_LOG_TAG, "revoke: could not build the frame peer=$peerId", it)
-            return false
-        }
-        val client = PersistentGattClientRegistry.lookup(peerId)
-        if (client == null) {
-            Log.i(DEUNLOCK_BG_LOG_TAG, "revoke: no client yet peer=$peerId; will retry on the next contact")
-            return false
-        }
-        val written = runCatching { client.writeResponse(frame) }.getOrDefault(false)
-        if (!written) {
-            Log.w(DEUNLOCK_BG_LOG_TAG, "revoke: write failed peer=$peerId; tombstone kept")
-            return false
-        }
-        runCatching { java.io.File(filesDir, BOND_RECORD_FILE_NAME).delete() }
-        Log.i(DEUNLOCK_BG_LOG_TAG, "revoke: delivered to the desktop peer=$peerId; tombstone cleared")
-        return true
     }
 
     private fun defaultBondListProvider(): BondListProvider = BondListProvider {
@@ -661,6 +605,68 @@ public class DeUnlockCompanionService : Service() {
          * Resolve the bytes the phone signs for [frameBytes] under the bond of
          * [peerId], or `null` when this phone must not answer at all.
          */
+        /**
+         * Decide what a challenge deserves, from a GATT callback, for every
+         * factory in the app.
+         *
+         * There used to be two: the service's own and the one `MainActivity`
+         * installs on launch. The revocation check lived in the first only, so
+         * after a revoke the phone still opened the approval prompt, the desktop
+         * waited out its deadline and reported a timeout — the tombstone was on
+         * disk and never consulted. One entry point, or the two wirings drift.
+         *
+         * Answers with the revoke frame when a tombstone is pending (AUDIT-001
+         * D-14), otherwise opens the approval prompt for a normal signature.
+         */
+        public fun handleChallenge(context: Context, peerId: String, frameBytes: ByteArray) {
+            if (deliverPendingRevoke(context, peerId)) return
+            val signingPayload = signingPayloadFor(peerId, frameBytes)
+            if (signingPayload == null) {
+                Log.w(
+                    DEUNLOCK_BG_LOG_TAG,
+                    "challenge dropped: no signing payload peer=$peerId (unknown bond, bad MAC, or unsupported wire version)",
+                )
+                return
+            }
+            launchApprovalActivity(context, peerId, signingPayload)
+        }
+
+        /**
+         * Tell the desktop that this bond was revoked, if a tombstone is pending.
+         *
+         * Returns true when the frame was written, in which case the challenge
+         * has been answered (the desktop verifies it, deletes its half and
+         * reports `bond-revoked`) and the caller must not open the approval UI.
+         */
+        public fun deliverPendingRevoke(context: Context, peerId: String): Boolean {
+            val record = runCatching { loadPersistedBond(context.filesDir) }.getOrNull() ?: return false
+            if (!record.revokePending || record.peerId != peerId) return false
+            if (record.revokeDeadlineMs != 0L && System.currentTimeMillis() > record.revokeDeadlineMs) {
+                Log.i(DEUNLOCK_BG_LOG_TAG, "revoke: tombstone expired undelivered; dropping peer=$peerId")
+                runCatching { java.io.File(context.filesDir, BOND_RECORD_FILE_NAME).delete() }
+                return false
+            }
+            val frame = runCatching {
+                uniffi.deunlock_mobile.buildRevoke(record.bondKey, System.currentTimeMillis().toULong())
+            }.getOrElse {
+                Log.w(DEUNLOCK_BG_LOG_TAG, "revoke: could not build the frame peer=$peerId", it)
+                return false
+            }
+            val client = PersistentGattClientRegistry.lookup(peerId)
+            if (client == null) {
+                Log.i(DEUNLOCK_BG_LOG_TAG, "revoke: no client yet peer=$peerId; will retry on the next contact")
+                return false
+            }
+            val written = runCatching { client.writeResponse(frame) }.getOrDefault(false)
+            if (!written) {
+                Log.w(DEUNLOCK_BG_LOG_TAG, "revoke: write failed peer=$peerId; tombstone kept")
+                return false
+            }
+            runCatching { java.io.File(context.filesDir, BOND_RECORD_FILE_NAME).delete() }
+            Log.i(DEUNLOCK_BG_LOG_TAG, "revoke: delivered to the desktop peer=$peerId; tombstone cleared")
+            return true
+        }
+
         internal fun signingPayloadFor(peerId: String, frameBytes: ByteArray): ByteArray? {
             val bondKey = bondKeyProvider?.bondKeyFor(peerId) ?: return null
             return signingPayloadProvider.signingPayloadFor(bondKey, frameBytes)

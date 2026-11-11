@@ -500,6 +500,11 @@ pub struct Orchestrator {
     audit_log: TokioMutex<Option<AuditLog>>,
     /// `tokio::time::Instant` of the next minute-tick.
     start: Instant,
+    /// Whether the last successful rotation advertised pair mode (no bonds).
+    /// Only used to log the transition once: "is the desktop discoverable right
+    /// now?" is the question an operator asks after a revoke, and the rotation
+    /// tick is otherwise silent at zero peers.
+    pair_mode_advertised: AtomicBool,
     /// Persisted "last time this peer actually answered". Drives the shortened
     /// deadline for peers that are no longer there — a bond outlives the phone,
     /// and a stale bond otherwise costs the full human-scale deadline on every
@@ -655,6 +660,7 @@ impl Orchestrator {
             audit_log: TokioMutex::new(audit_log),
             start,
             presence,
+            pair_mode_advertised: AtomicBool::new(false),
         }
     }
 
@@ -762,6 +768,19 @@ impl Orchestrator {
             Ok(()) => {
                 self.rotation_failures.store(0, Ordering::Release);
                 self.transport_ready.store(true, Ordering::Release);
+                // Transition logging only: at zero peers the tick has nothing
+                // else to say, and "am I discoverable again?" is exactly the
+                // question a revoke leaves behind (AUDIT-001 D-14/D-15).
+                if snapshot.is_empty() {
+                    if !self.pair_mode_advertised.swap(true, Ordering::AcqRel) {
+                        tracing::info!(
+                            target: ROTATION_LOG_TARGET,
+                            "advertising in pair mode: no bonds, pair service discoverable"
+                        );
+                    }
+                } else {
+                    self.pair_mode_advertised.store(false, Ordering::Release);
+                }
                 for (peer_id, _) in &snapshot {
                     let uuid_bytes = session_uuid_for(snapshot_key(&snapshot, peer_id), minute);
                     let uuid = Uuid::from_bytes(uuid_bytes);

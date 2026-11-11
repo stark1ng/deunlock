@@ -483,23 +483,11 @@ class MainActivity : FragmentActivity() {
                 peerId = bond.peerId,
                 deviceMac = bond.peerId,
                 onChallenge = { peerId, frameBytes ->
-                    // v2 signs an auth transcript, not the frame body: the
-                    // signing payload comes from the Rust parser so the phone
-                    // and the desktop cannot disagree about what was signed.
-                    val signingPayload =
-                        DeUnlockCompanionService.signingPayloadFor(peerId, frameBytes)
-                    if (signingPayload == null) {
-                        android.util.Log.w(
-                            "deunlock.main",
-                            "challenge dropped: no signing payload peer=$peerId",
-                        )
-                    } else {
-                        DeUnlockCompanionService.launchApprovalActivity(
-                            applicationContext,
-                            peerId,
-                            signingPayload,
-                        )
-                    }
+                    // One entry point for every factory: it decides between the
+                    // revocation frame and the approval prompt, and the v2
+                    // signing payload comes from the Rust parser so the phone and
+                    // the desktop cannot disagree about what was signed.
+                    DeUnlockCompanionService.handleChallenge(applicationContext, peerId, frameBytes)
                 },
             )
             PersistentGattClientRegistry.put(bond.peerId, client)
