@@ -328,6 +328,54 @@ async fn wait_for_reason(
     }
 }
 
+/// Stores a bond that arrived through QR pairing.
+///
+/// Writes `bonds.toml` through [`BondStore`], which the daemon already watches with
+/// inotify — so the orchestrator reloads its peer set without this code holding the
+/// orchestrator or duplicating its reload logic.
+struct QrBondSink {
+    bonds_file: std::path::PathBuf,
+    keys_dir: std::path::PathBuf,
+}
+
+impl QrBondSink {
+    fn new(bonds_file: std::path::PathBuf, keys_dir: std::path::PathBuf) -> Self {
+        Self { bonds_file, keys_dir }
+    }
+}
+
+impl deunlock_net::PairingSink for QrBondSink {
+    fn complete(&self, phone_pubkey: [u8; 32], bond_key: [u8; 32]) -> Result<(), String> {
+        let peer_id = peer_id_from_pubkey(&phone_pubkey);
+        let mut store = BondStore::load(&self.bonds_file).map_err(|e| format!("bonds.toml: {e}"))?;
+        // A revoked peer that re-pairs must not be resurrected by accident; a live
+        // one is left alone so a repeated scan cannot fork its identity.
+        if let Some(existing) = store.list().iter().find(|b| b.peer_id == peer_id) {
+            if matches!(existing.status, BondStatus::Revoked { .. }) {
+                return Err("this phone is revoked; run `deunlock revoke --undo` first".to_owned());
+            }
+            return Ok(());
+        }
+        let bond = Bond {
+            peer_id: peer_id.clone(),
+            pubkey: phone_pubkey,
+            name: "DeUnlock phone (QR)".to_owned(),
+            created_at: time::OffsetDateTime::now_utc(),
+            status: BondStatus::Bonded,
+        };
+        store.add(bond).map_err(|e| format!("bonds.toml: {e}"))?;
+        store.save(&self.bonds_file).map_err(|e| format!("bonds.toml: {e}"))?;
+
+        // The key the daemon will look up for this peer must be the one the phone
+        // derived. If writing it fails, the pairing fails: a bond record without a
+        // key would surface later as an unexplained failed hello.
+        persist_pair_bond_key(&self.keys_dir, &peer_id, &bond_key).map_err(|e| format!("keys: {e}"))?;
+
+        tracing::info!(peer = %peer_id, "QR pairing stored a bond");
+        Ok(())
+    }
+}
+
 /// Start the LAN listener when `DEUNLOCK_LAN` is set, returning its peripheral.
 ///
 /// `DEUNLOCK_NET_CERT` / `DEUNLOCK_NET_KEY` override the identity paths (default
@@ -373,6 +421,19 @@ async fn start_lan(config: &Config, host_id: Option<[u8; 32]>) -> Option<Arc<dyn
             return None;
         }
     };
+
+    // Pairing is always armed on the listener: with no offer file present a `DLP1`
+    // record is refused, so being armed costs nothing and means `deunlock pair-qr`
+    // works without restarting the daemon.
+    let offer_path = std::env::var_os("DEUNLOCK_PAIRING_OFFER").map_or_else(
+        || std::path::PathBuf::from(deunlock_core::DEFAULT_PAIRING_OFFER_PATH),
+        std::path::PathBuf::from,
+    );
+    let server = server.with_pairing(
+        std::sync::Arc::new(deunlock_net::FilePairingOffers::new(offer_path.clone())),
+        std::sync::Arc::new(QrBondSink::new(config.bonds_file.clone(), config.keys_dir.clone())),
+    );
+    tracing::info!(offers = %offer_path.display(), "QR pairing armed on the LAN listener");
     let peripheral = server.peripheral();
 
     let host_hex: String = host_id.iter().map(|b| format!("{b:02x}")).collect();

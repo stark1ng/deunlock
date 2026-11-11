@@ -97,6 +97,80 @@ pub fn verify_hello(
         .map_err(|e| NetError::Handshake(e.to_string()))
 }
 
+
+/// Where the listener looks for a pairing offer.
+///
+/// The offer arrives from another process (`deunlock pair-qr`), so this is a
+/// boundary rather than a field: the trait keeps the file format out of the
+/// transport and lets a test hand over an offer directly.
+pub trait PairingOffers: Send + Sync {
+    /// Take the offer that is valid right now, if any.
+    ///
+    /// # Errors
+    ///
+    /// A message describing why a present offer could not be used. `Ok(None)`
+    /// means "nothing is pending", which is the normal state.
+    fn take(&self, now: u64) -> Result<Option<deunlock_core::PendingOffer>, String>;
+}
+
+/// A one-shot pairing offer stored in a file, as written by `deunlock pair-qr`.
+///
+/// Taking it **removes** it: a scanned code buys exactly one attempt. A failed
+/// pairing means the user prints a new code, which is a small annoyance against
+/// leaving a 256-bit secret sitting in `/run` for its whole TTL.
+#[derive(Debug)]
+pub struct FilePairingOffers {
+    path: std::path::PathBuf,
+}
+
+impl FilePairingOffers {
+    /// Watch `path` for offers.
+    #[must_use]
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl Default for FilePairingOffers {
+    fn default() -> Self {
+        Self::new(deunlock_core::DEFAULT_PAIRING_OFFER_PATH)
+    }
+}
+
+impl PairingOffers for FilePairingOffers {
+    fn take(&self, now: u64) -> Result<Option<deunlock_core::PendingOffer>, String> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let offer = match deunlock_core::PendingOffer::read(&self.path, now) {
+            Ok(offer) => offer,
+            Err(e) => {
+                // An expired or corrupt file is dead weight: drop it so the next
+                // pairing attempt is not blocked by it.
+                let _ = std::fs::remove_file(&self.path);
+                return Err(e.to_string());
+            }
+        };
+        std::fs::remove_file(&self.path).map_err(|e| format!("cannot consume the offer: {e}"))?;
+        Ok(Some(offer))
+    }
+}
+
+/// Where a completed pairing is persisted.
+///
+/// The LAN transport does not own the bond store — the daemon does — so the
+/// listener reports the result and lets the owner write it and reload its peer
+/// set.
+pub trait PairingSink: Send + Sync {
+    /// Record a new bond.
+    ///
+    /// # Errors
+    ///
+    /// A message describing why the bond could not be stored. The phone is told
+    /// the pairing failed, so a store error never leaves a half-paired device.
+    fn complete(&self, phone_pubkey: [u8; 32], bond_key: [u8; 32]) -> Result<(), String>;
+}
+
 /// A live session attached to a peer.
 struct Session {
     /// Frames for the phone; the writer task owns the read end.
@@ -237,6 +311,7 @@ pub struct LanServer {
     host_id: [u8; 32],
     peripheral: Arc<LanPeripheral>,
     bonds: Arc<dyn BondLookup>,
+    pairing: Option<Arc<PairingWiring>>,
 }
 
 impl LanServer {
@@ -260,7 +335,18 @@ impl LanServer {
             host_id,
             peripheral: LanPeripheral::new(host_id),
             bonds,
+            pairing: None,
         })
+    }
+
+    /// Accept QR pairing requests on this listener.
+    ///
+    /// Without this, a `DLP1` record is refused: an unpaired phone must not be able
+    /// to make the listener do work.
+    #[must_use]
+    pub fn with_pairing(mut self, offers: Arc<dyn PairingOffers>, sink: Arc<dyn PairingSink>) -> Self {
+        self.pairing = Some(Arc::new(PairingWiring { offers, sink }));
+        self
     }
 
     /// The peripheral the orchestrator should use.
@@ -316,8 +402,9 @@ impl LanServer {
                     let host_id = self.host_id;
                     let peripheral = Arc::clone(&self.peripheral);
                     let bonds = Arc::clone(&self.bonds);
+                    let pairing = self.pairing.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(acceptor, tcp, host_id, peripheral, bonds, peer_addr).await {
+                        if let Err(e) = handle_connection(acceptor, tcp, host_id, peripheral, bonds, pairing, peer_addr).await {
                             tracing::warn!(peer = %peer_addr, error = %e, "LAN session rejected");
                         }
                     });
@@ -327,6 +414,35 @@ impl LanServer {
     }
 }
 
+
+
+/// Connect to a desktop's LAN listener, pinned to its certificate fingerprint.
+///
+/// The ALPN identifier is not negotiated here: the desktop's TLS acceptor does not
+/// require one, and the protocol start is unambiguous (`"DLS1"` arrives first).
+/// This is the client half used by `deunlock pair-probe` and by tests.
+///
+/// # Errors
+///
+/// [`NetError::Io`] for a refused or timed-out connection, [`NetError::Handshake`]
+/// when the presented certificate does not match the pin or TLS fails.
+pub async fn connect_pinned(
+    addr: &str,
+    fingerprint: &[u8; 32],
+    timeout: std::time::Duration,
+) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, NetError> {
+    let connector = tokio_rustls::TlsConnector::from(crate::tls::pinned_client_config(*fingerprint));
+    let tcp = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
+        .await
+        .map_err(|_| NetError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out")))??;
+    let name = tokio_rustls::rustls::pki_types::ServerName::try_from("deunlock.local")
+        .map_err(|e| NetError::Handshake(format!("server name: {e}")))?
+        .to_owned();
+    let tls = tokio::time::timeout(timeout, connector.connect(name, tcp))
+        .await
+        .map_err(|_| NetError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake timed out")))??;
+    Ok(tls)
+}
 
 /// A fresh 32-byte session nonce from the OS RNG.
 ///
@@ -339,12 +455,19 @@ fn random_session_nonce() -> [u8; SESSION_NONCE_BYTES] {
     nonce
 }
 
+/// The two halves a listener needs to answer a pairing request.
+struct PairingWiring {
+    offers: Arc<dyn PairingOffers>,
+    sink: Arc<dyn PairingSink>,
+}
+
 async fn handle_connection(
     acceptor: TlsAcceptor,
     tcp: tokio::net::TcpStream,
     host_id: [u8; 32],
     peripheral: Arc<LanPeripheral>,
     bonds: Arc<dyn BondLookup>,
+    pairing: Option<Arc<PairingWiring>>,
     peer_addr: SocketAddr,
 ) -> Result<(), NetError> {
     let tls = acceptor
@@ -360,8 +483,15 @@ async fn handle_connection(
     write_message(&mut tls, &encode_session_challenge(&session_nonce)).await?;
 
     let (mut reader, mut writer) = tokio::io::split(tls);
-    let hello_bytes = read_message(&mut reader).await?;
-    let hello = verify_hello(&hello_bytes, &host_id, &session_nonce, bonds.as_ref())?;
+    let first = read_message(&mut reader).await?;
+
+    // The phone either proves an existing bond (hello) or asks for a new one
+    // (pairing request). Pairing needs an armed offer; without one it is refused,
+    // so an unpaired phone cannot make the listener work.
+    if first.starts_with(&deunlock_core::PAIR_REQUEST_MAGIC) {
+        return handle_pairing(first, &mut writer, &host_id, pairing.as_deref(), peer_addr).await;
+    }
+    let hello = verify_hello(&first, &host_id, &session_nonce, bonds.as_ref())?;
     let peer_hex = peer_id_hex(&hello.peer_id);
     tracing::info!(peer = %peer_hex, addr = %peer_addr, "LAN session authenticated");
 
@@ -390,6 +520,59 @@ async fn handle_connection(
     writer_task.abort();
     tracing::info!(peer = %peer_hex, "LAN session closed");
     Ok(())
+}
+
+
+/// Answer a `DLP1` pairing request.
+///
+/// On success the phone has learned that this desktop held the scanned secret, and
+/// both sides have derived the same bond. The connection is closed afterwards: the
+/// phone reconnects and authenticates with a hello, which also proves the bond it
+/// stored is the one the desktop stored.
+async fn handle_pairing<W>(
+    request: Vec<u8>,
+    writer: &mut W,
+    host_id: &[u8; 32],
+    pairing: Option<&PairingWiring>,
+    peer_addr: SocketAddr,
+) -> Result<(), NetError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let Some(pairing) = pairing else {
+        return Err(NetError::Handshake("pairing request but no pairing is armed".to_owned()));
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let offer = pairing
+        .offers
+        .take(now)
+        .map_err(NetError::Handshake)?
+        .ok_or_else(|| NetError::Handshake("no pairing offer is pending".to_owned()))?;
+
+    if offer.host_id_bytes().map_err(|e| NetError::Handshake(e.to_string()))? != *host_id {
+        return Err(NetError::Handshake("pairing offer was minted for another host".to_owned()));
+    }
+    let secret = offer.secret_bytes().map_err(|e| NetError::Handshake(e.to_string()))?;
+
+    let phone_pubkey = deunlock_core::verify_pair_request(&request, &secret, host_id)
+        .map_err(|e| NetError::Handshake(e.to_string()))?;
+    let bond_key = deunlock_core::derive_qr_bond_key(&secret, host_id, &phone_pubkey);
+
+    // Store first, answer second: a phone that sees DLP2 must already be bonded,
+    // otherwise the next hello would fail and look like a protocol bug.
+    pairing.sink.complete(phone_pubkey, bond_key).map_err(NetError::Handshake)?;
+
+    write_message(writer, &deunlock_core::encode_pair_accept(&secret, host_id, &phone_pubkey)).await?;
+    tracing::info!(peer = %peer_address(peer_addr), "LAN pairing completed");
+    Ok(())
+}
+
+/// `SocketAddr` in the log format used by the rest of this module.
+fn peer_address(addr: SocketAddr) -> String {
+    addr.to_string()
 }
 
 /// Hex helper used by `Debug`.

@@ -15,6 +15,7 @@ Commands:
   uninstall-pam      Restore a PAM service file from its `.bak` and remove the bak
   install-presenced  Install the `deunlock-presenced` systemd user unit and (live mode) reload + enable + start it
   pair-qr            Print a pairing QR carrying the host identity, LAN endpoint, TLS pin and a one-time pairing secret (AUDIT-001 D-07)
+  pair-probe         Stand in for the phone: connect to the pinned LAN listener and walk the QR pairing exchange end to end
   doctor             Inspect the unlock chain: daemon liveness, bonds file, keys file modes, BlueZ adapter, systemd user unit state, audit-log tail, and the `XDG_RUNTIME_DIR` SSH-session caveat. Emits one greppable `key=value` line per probe plus a final `doctor=ok|warn|fail` summary. `--json` emits the same data as a typed JSON object for tooling
   help               Print this message or the help of the given subcommand(s)
 

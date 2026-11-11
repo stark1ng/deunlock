@@ -35,6 +35,8 @@ deunlock-core = { path = "../deunlock-core" }
 # `pair` module dispatches against in production. `default-features = false`
 # strips the S-003 `FakePeripheral` test double from the shipped CLI binary.
 deunlock-net = { path = "../deunlock-net" }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 deunlock-transport = { path = "../deunlock-transport", default-features = false }
 # HKDF-SHA256 for the app-level OOB code derivation. Pinned to the same major

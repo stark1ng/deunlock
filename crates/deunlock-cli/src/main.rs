@@ -24,6 +24,7 @@ use deunlock_cli::{
     list::run_list,
     pair::{ListOpts, PairOpts, run_pair},
     pair_backend::BluerPairBackend,
+    pair_probe::{PairProbeOpts, run as run_pair_probe},
     pair_qr::{self, PairQrOpts},
     revoke::{RevokeOpts, run_revoke},
     status::{StatusOpts, run_status},
@@ -69,6 +70,9 @@ enum Cmd {
     /// Print a pairing QR carrying the host identity, LAN endpoint, TLS pin and
     /// a one-time pairing secret (AUDIT-001 D-07).
     PairQr(PairQrOpts),
+    /// Stand in for the phone: connect to the pinned LAN listener and walk the QR
+    /// pairing exchange end to end.
+    PairProbe(PairProbeOpts),
     /// Inspect the unlock chain: daemon liveness, bonds file, keys file
     /// modes, BlueZ adapter, systemd user unit state, audit-log tail,
     /// and the `XDG_RUNTIME_DIR` SSH-session caveat. Emits one
@@ -108,6 +112,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Pair(opts) => run_pair_cli(&opts).await,
         Cmd::PairQr(opts) => run_pair_qr(&opts),
+        Cmd::PairProbe(opts) => run_pair_probe(&opts).await,
         Cmd::List(opts) => run_list_cli(&opts),
         Cmd::Revoke(opts) => run_revoke_cli(&opts),
         Cmd::Status(opts) => run_status_cli(&opts).await,

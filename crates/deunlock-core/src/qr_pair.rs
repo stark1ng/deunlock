@@ -28,6 +28,8 @@
 //! that secret is only as private as the screen showing the QR. That is the
 //! point: it is trusted because it was seen, not because it was sent.
 
+use std::os::unix::fs::OpenOptionsExt as _;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -39,6 +41,9 @@ pub const QR_VERSION: u8 = 1;
 
 /// Length of the pairing secret.
 pub const PAIRING_SECRET_BYTES: usize = 32;
+
+/// Where `deunlock pair-qr` leaves the offer for the daemon to find.
+pub const DEFAULT_PAIRING_OFFER_PATH: &str = "/run/deunlock/pairing.offer";
 
 /// Maximum length of the LAN host name a QR may carry.
 pub const MAX_HOST_BYTES: usize = 63;
@@ -234,6 +239,134 @@ impl<'a> Cursor<'a> {
     }
 }
 
+
+/// The offer a running daemon is currently willing to accept, as written to disk
+/// by `deunlock pair-qr` and consumed by the LAN listener.
+///
+/// It lives in a file rather than in the daemon's memory because the two
+/// processes are different: the CLI prints the QR, the daemon answers it. The file
+/// is the hand-off, and it is short-lived on purpose.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingOffer {
+    /// Hex of the 32-byte pairing secret.
+    pub secret: String,
+    /// Hex of the host id the secret was minted for.
+    pub host_id: String,
+    /// Unix seconds after which the offer is dead.
+    pub expires_at: u64,
+}
+
+impl PendingOffer {
+    /// Build a file record from an offer.
+    #[must_use]
+    pub fn from_offer(offer: &PairingOffer) -> Self {
+        Self {
+            secret: hex_encode(&offer.secret),
+            host_id: hex_encode(&offer.host_id),
+            expires_at: offer.expires_at,
+        }
+    }
+
+    /// The secret as bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`QrError::Malformed`] when the file was corrupted or edited.
+    pub fn secret_bytes(&self) -> Result<[u8; PAIRING_SECRET_BYTES], QrError> {
+        let bytes = hex_decode(&self.secret).ok_or_else(|| QrError::Malformed {
+            reason: "offer secret is not 32 bytes of hex".to_owned(),
+        })?;
+        bytes.try_into().map_err(|v: Vec<u8>| QrError::Malformed {
+            reason: format!("offer secret is {} bytes, expected {PAIRING_SECRET_BYTES}", v.len()),
+        })
+    }
+
+    /// The host id as bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`QrError::Malformed`] when the file was corrupted or edited.
+    pub fn host_id_bytes(&self) -> Result<[u8; 32], QrError> {
+        let bytes = hex_decode(&self.host_id).ok_or_else(|| QrError::Malformed {
+            reason: "offer host_id is not 32 bytes of hex".to_owned(),
+        })?;
+        bytes.try_into().map_err(|v: Vec<u8>| QrError::Malformed {
+            reason: format!("offer host_id is {} bytes, expected 32", v.len()),
+        })
+    }
+
+    /// Write the offer where the daemon looks for it, mode `0600`.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O or serialization failure, including a directory that cannot be
+    /// created.
+    pub fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write as _;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        let tmp = path.with_extension("tmp");
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(&body)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Read the offer, refusing one that has expired.
+    ///
+    /// # Errors
+    ///
+    /// [`QrError::Malformed`] for an unreadable or corrupt file,
+    /// [`QrError::Expired`] when `now` is past the expiry.
+    pub fn read(path: &std::path::Path, now: u64) -> Result<Self, QrError> {
+        let body = std::fs::read(path).map_err(|e| QrError::Malformed {
+            reason: format!("cannot read {}: {e}", path.display()),
+        })?;
+        let offer: Self = serde_json::from_slice(&body).map_err(|e| QrError::Malformed {
+            reason: format!("cannot parse {}: {e}", path.display()),
+        })?;
+        // Validate now rather than when the bytes are used: a corrupt secret should
+        // fail at the boundary, not halfway through a pairing.
+        let _ = offer.secret_bytes()?;
+        let _ = offer.host_id_bytes()?;
+        if now > offer.expires_at {
+            return Err(QrError::Expired {
+                expires_at: offer.expires_at,
+                now,
+            });
+        }
+        Ok(offer)
+    }
+}
+
+/// Lowercase hex, without pulling in a formatting dependency.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Decode hex, returning `None` on any non-hex character or odd length.
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,4 +464,47 @@ mod tests {
         let text = offer().encode().expect("encode");
         assert!(!text.contains(&"44".repeat(32)), "secret must not appear as hex");
     }
+    #[test]
+    fn a_pending_offer_round_trips_through_disk() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("pairing.offer");
+        let offer = offer();
+        let pending = PendingOffer::from_offer(&offer);
+        pending.write(&path).expect("write");
+
+        let read_back = PendingOffer::read(&path, 1_700_000_000).expect("read");
+        assert_eq!(read_back.secret_bytes().expect("secret"), offer.secret);
+        assert_eq!(read_back.host_id_bytes().expect("host"), offer.host_id);
+    }
+
+    #[test]
+    fn a_pending_offer_file_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("pairing.offer");
+        PendingOffer::from_offer(&offer()).write(&path).expect("write");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the secret must not be world-readable");
+    }
+
+    #[test]
+    fn an_expired_pending_offer_is_refused_at_read() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("pairing.offer");
+        PendingOffer::from_offer(&offer()).write(&path).expect("write");
+        assert!(matches!(
+            PendingOffer::read(&path, 1_800_000_001),
+            Err(QrError::Expired { .. })
+        ));
+    }
+
+    #[test]
+    fn a_corrupt_pending_offer_is_refused() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("pairing.offer");
+        std::fs::write(&path, br#"{"secret":"zz","host_id":"00","expires_at":99999999999}"#).expect("write");
+        assert!(matches!(PendingOffer::read(&path, 0), Err(QrError::Malformed { .. })));
+        assert!(PendingOffer::read(&dir.path().join("missing"), 0).is_err());
+    }
+
 }

@@ -33,6 +33,10 @@ pub struct PairQrOpts {
     /// Also write a PNG here (requires the `qrencode` binary).
     #[arg(long, value_name = "PATH")]
     pub png: Option<PathBuf>,
+    /// Where to leave the offer for the daemon (default: the path the daemon
+    /// watches, `/run/deunlock/pairing.offer`).
+    #[arg(long, value_name = "PATH")]
+    pub offer_path: Option<PathBuf>,
     /// Print only the payload, for piping into another tool.
     #[arg(long)]
     pub quiet: bool,
@@ -85,6 +89,25 @@ pub fn run(opts: &PairQrOpts, host_key_path: &Path, cert_path: &Path, key_path: 
     let offer = build_offer(host_key_path, cert_path, key_path, &opts.lan_host, opts.port, opts.ttl, now)?;
     let payload = offer.encode()?;
 
+    // Hand the secret to the daemon. Without this file the listener refuses every
+    // pairing request, which is the safe default: no offer, no pairing.
+    let offer_path = opts
+        .offer_path
+        .clone()
+        .or_else(|| std::env::var_os("DEUNLOCK_PAIRING_OFFER").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(deunlock_core::DEFAULT_PAIRING_OFFER_PATH));
+    let wrote_offer = match deunlock_core::PendingOffer::from_offer(&offer).write(&offer_path) {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!(
+                "warning: could not write the offer to {}: {err}",
+                offer_path.display()
+            );
+            eprintln!("         the daemon will refuse this code; pass --offer-path to somewhere it reads");
+            false
+        }
+    };
+
     if let Some(png) = &opts.png {
         write_png(png, &payload)?;
     }
@@ -97,6 +120,11 @@ pub fn run(opts: &PairQrOpts, host_key_path: &Path, cert_path: &Path, key_path: 
     println!("host:    {}:{}", offer.lan_host, offer.lan_port);
     println!("pin:     {}", hex(&offer.tls_fingerprint));
     println!("expires: {} (in {}s)", offer.expires_at, offer.expires_at.saturating_sub(now));
+    println!(
+        "offer:   {} ({})",
+        offer_path.display(),
+        if wrote_offer { "armed for one attempt" } else { "NOT written" }
+    );
     println!();
     println!("Scan this with the DeUnlock app. The code contains a one-time pairing secret —");
     println!("treat a screenshot of it like a password.");

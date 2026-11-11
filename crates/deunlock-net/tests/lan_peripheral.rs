@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use deunlock_core::BOND_KEY_BYTES;
 use deunlock_net::lan::{
-    HELLO_LEN, LanServer, PEER_ID_BYTES, SESSION_NONCE_BYTES, decode_session_challenge, encode_hello, peer_id_hex,
-    verify_hello,
+    HELLO_LEN, LanServer, PEER_ID_BYTES, PairingOffers, PairingSink, SESSION_NONCE_BYTES, decode_session_challenge,
+    encode_hello, peer_id_hex, verify_hello,
 };
 use deunlock_net::{LanIdentity, NetError, pinned_client_config};
 use deunlock_transport::{BondKey, Peripheral};
@@ -244,4 +244,241 @@ async fn a_challenge_for_a_peer_with_no_session_fails_loudly() {
         .is_ok());
     let empty: HashSet<uuid::Uuid> = HashSet::new();
     assert!(peripheral.set_session_uuids(empty).await.is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// QR pairing over the same pinned connection
+// ---------------------------------------------------------------------------
+
+/// An offer held in memory instead of in `/run/deunlock`.
+struct MemoryOffers(std::sync::Mutex<Option<deunlock_core::PendingOffer>>);
+
+impl PairingOffers for MemoryOffers {
+    fn take(&self, now: u64) -> Result<Option<deunlock_core::PendingOffer>, String> {
+        match self.0.lock().expect("lock").take() {
+            Some(offer) if now <= offer.expires_at => Ok(Some(offer)),
+            Some(_) => Err("offer expired".to_owned()),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Records what the listener decided to bond.
+#[derive(Default)]
+struct RecordingSink(std::sync::Mutex<Vec<([u8; 32], [u8; 32])>>);
+
+impl PairingSink for RecordingSink {
+    fn complete(&self, phone_pubkey: [u8; 32], bond_key: [u8; 32]) -> Result<(), String> {
+        self.0.lock().expect("lock").push((phone_pubkey, bond_key));
+        Ok(())
+    }
+}
+
+fn pending_for(secret: &[u8; 32], expires_at: u64) -> deunlock_core::PendingOffer {
+    deunlock_core::PendingOffer {
+        secret: secret.iter().map(|b| format!("{b:02x}")).collect(),
+        host_id: HOST_ID.iter().map(|b| format!("{b:02x}")).collect(),
+        expires_at,
+    }
+}
+
+/// Connect, answer the session challenge, and send a DLP1 request.
+async fn connect_and_request(
+    addr: std::net::SocketAddr,
+    identity: &LanIdentity,
+    request: &[u8],
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    let connector = tokio_rustls::TlsConnector::from(pinned_client_config(identity.fingerprint()));
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp");
+    let name = ServerName::try_from("deunlock.local").expect("name");
+    let mut tls = connector.connect(name, tcp).await.expect("handshake");
+    // The desktop still speaks first, even on the pairing path.
+    let _challenge = deunlock_net::read_message(&mut tls).await.expect("session challenge");
+    deunlock_net::write_message(&mut tls, request).await.expect("pairing request");
+    tls
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[tokio::test]
+async fn a_scanned_code_bonds_the_phone_and_the_desktop_agrees_on_the_key() {
+    const SECRET: [u8; 32] = [0x77; 32];
+    let phone_pubkey = [0x22u8; 32];
+    let identity = LanIdentity::generate().expect("identity");
+    let offers = Arc::new(MemoryOffers(std::sync::Mutex::new(Some(pending_for(&SECRET, now_secs() + 600)))));
+    let sink = Arc::new(RecordingSink::default());
+
+    let server = LanServer::bind(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        &identity,
+        HOST_ID,
+        Arc::new(|_: &str| None),
+    )
+    .await
+    .expect("bind")
+    .with_pairing(Arc::clone(&offers) as Arc<dyn PairingOffers>, Arc::clone(&sink) as Arc<dyn PairingSink>);
+    let addr = server.local_addr().expect("addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+
+    // Phone side: build the request from the scanned secret.
+    let request = deunlock_core::encode_pair_request(&SECRET, &HOST_ID, &phone_pubkey);
+    let mut client = connect_and_request(addr, &identity, &request).await;
+    let accept = deunlock_net::read_message(&mut client).await.expect("accept");
+
+    // The phone must be able to tell that this desktop held the code.
+    deunlock_core::verify_pair_accept(&accept, &SECRET, &HOST_ID, &phone_pubkey).expect("accept verifies");
+
+    // And the desktop must have stored exactly the key the phone derives.
+    let recorded = sink.0.lock().expect("lock").clone();
+    assert_eq!(recorded.len(), 1, "exactly one bond");
+    assert_eq!(recorded[0].0, phone_pubkey);
+    assert_eq!(recorded[0].1, deunlock_core::derive_qr_bond_key(&SECRET, &HOST_ID, &phone_pubkey));
+
+    // A code buys one attempt.
+    assert!(offers.0.lock().expect("lock").is_none(), "offer is consumed");
+
+    let _ = shutdown_tx.send(true);
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn a_pairing_request_with_no_offer_armed_is_refused() {
+    let identity = LanIdentity::generate().expect("identity");
+    let sink = Arc::new(RecordingSink::default());
+    let offers = Arc::new(MemoryOffers(std::sync::Mutex::new(None)));
+
+    let server = LanServer::bind(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        &identity,
+        HOST_ID,
+        Arc::new(|_: &str| None),
+    )
+    .await
+    .expect("bind")
+    .with_pairing(Arc::clone(&offers) as Arc<dyn PairingOffers>, Arc::clone(&sink) as Arc<dyn PairingSink>);
+    let addr = server.local_addr().expect("addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+
+    let request = deunlock_core::encode_pair_request(&[0x77; 32], &HOST_ID, &[0x22; 32]);
+    let mut client = connect_and_request(addr, &identity, &request).await;
+    assert!(
+        deunlock_net::read_message(&mut client).await.is_err(),
+        "no acceptance may come back without a pending offer"
+    );
+    assert!(sink.0.lock().expect("lock").is_empty());
+
+    let _ = shutdown_tx.send(true);
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn a_request_for_a_secret_we_never_printed_is_refused() {
+    const SECRET: [u8; 32] = [0x77; 32];
+    let identity = LanIdentity::generate().expect("identity");
+    let offers = Arc::new(MemoryOffers(std::sync::Mutex::new(Some(pending_for(&SECRET, now_secs() + 600)))));
+    let sink = Arc::new(RecordingSink::default());
+
+    let server = LanServer::bind(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        &identity,
+        HOST_ID,
+        Arc::new(|_: &str| None),
+    )
+    .await
+    .expect("bind")
+    .with_pairing(Arc::clone(&offers) as Arc<dyn PairingOffers>, Arc::clone(&sink) as Arc<dyn PairingSink>);
+    let addr = server.local_addr().expect("addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+
+    // Attacker's own secret, hoping the desktop will bond whatever it is told.
+    let request = deunlock_core::encode_pair_request(&[0x99; 32], &HOST_ID, &[0x22; 32]);
+    let mut client = connect_and_request(addr, &identity, &request).await;
+    assert!(deunlock_net::read_message(&mut client).await.is_err(), "tag must fail");
+    assert!(sink.0.lock().expect("lock").is_empty(), "nothing may be bonded");
+
+    let _ = shutdown_tx.send(true);
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn a_pairing_request_on_a_listener_without_pairing_is_refused() {
+    let identity = LanIdentity::generate().expect("identity");
+    let server = LanServer::bind(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        &identity,
+        HOST_ID,
+        Arc::new(|_: &str| None),
+    )
+    .await
+    .expect("bind");
+    let addr = server.local_addr().expect("addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+
+    let request = deunlock_core::encode_pair_request(&[0x77; 32], &HOST_ID, &[0x22; 32]);
+    let mut client = connect_and_request(addr, &identity, &request).await;
+    assert!(deunlock_net::read_message(&mut client).await.is_err());
+
+    let _ = shutdown_tx.send(true);
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn a_file_backed_offer_pairs_once_and_is_then_gone() {
+    const SECRET: [u8; 32] = [0x5Au8; 32];
+    let phone_pubkey = [0x22u8; 32];
+    let identity = LanIdentity::generate().expect("identity");
+    let dir = tempfile::tempdir().expect("tmp");
+    let offer_path = dir.path().join("pairing.offer");
+
+    // Exactly what `deunlock pair-qr` writes.
+    let offer = deunlock_core::PairingOffer {
+        host_id: HOST_ID,
+        host_pubkey: [0x11; 32],
+        lan_host: "127.0.0.1".to_owned(),
+        lan_port: 47_823,
+        tls_fingerprint: [0x33; 32],
+        secret: SECRET,
+        expires_at: now_secs() + 600,
+    };
+    deunlock_core::PendingOffer::from_offer(&offer).write(&offer_path).expect("write offer");
+
+    let sink = Arc::new(RecordingSink::default());
+    let server = LanServer::bind(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        &identity,
+        HOST_ID,
+        Arc::new(|_: &str| None),
+    )
+    .await
+    .expect("bind")
+    .with_pairing(
+        Arc::new(deunlock_net::FilePairingOffers::new(offer_path.clone())) as Arc<dyn PairingOffers>,
+        Arc::clone(&sink) as Arc<dyn PairingSink>,
+    );
+    let addr = server.local_addr().expect("addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+
+    let request = deunlock_core::encode_pair_request(&SECRET, &HOST_ID, &phone_pubkey);
+    let mut client = connect_and_request(addr, &identity, &request).await;
+    let accept = deunlock_net::read_message(&mut client).await.expect("accept");
+    deunlock_core::verify_pair_accept(&accept, &SECRET, &HOST_ID, &phone_pubkey).expect("accept verifies");
+    assert_eq!(sink.0.lock().expect("lock").len(), 1);
+    assert!(!offer_path.exists(), "the offer file must be consumed");
+
+    // A second attempt with the same (now gone) code gets nothing.
+    let mut second = connect_and_request(addr, &identity, &request).await;
+    assert!(deunlock_net::read_message(&mut second).await.is_err());
+
+    let _ = shutdown_tx.send(true);
+    let _ = server_task.await;
 }
