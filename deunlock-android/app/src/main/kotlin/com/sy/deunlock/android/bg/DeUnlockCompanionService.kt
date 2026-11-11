@@ -154,6 +154,39 @@ public fun interface BondKeyProvider {
  * Production wires `UniffiChallengeVerifier` (below); tests inject
  * a fake.
  */
+/**
+ * Computes the exact byte string the phone must sign for one challenge frame.
+ *
+ * Wire v2 signs an *auth transcript* (`deunlock-auth-v2` ‖ version ‖ host_id ‖
+ * service ‖ user ‖ nonce ‖ issued_at), not the frame body: the desktop bound the
+ * answer to the question it asked (AUDIT-001 D-04), so a signature over
+ * `version ‖ nonce ‖ payload` no longer verifies. Deriving those bytes here, by
+ * hand, is how the two halves drifted apart once already — the approval path
+ * kept stripping a 16-byte tag and signing a body the daemon stopped checking
+ * in v2, which surfaced only as `bad-signature` with a valid key.
+ *
+ * So the bytes come from the same Rust parser the desktop's transcript comes
+ * from: `parse_challenge` MAC-checks the frame first (nothing is signed before
+ * the phone has proven the frame came from its bonded peer) and returns
+ * `sign_payload` already normalized across v1 and v2.
+ *
+ * `null` means "do not sign": unknown peer, missing bond key, bad MAC, or a
+ * malformed frame. The caller drops the challenge silently.
+ */
+public fun interface SigningPayloadProvider {
+    public fun signingPayloadFor(bondKey: ByteArray, frameBytes: ByteArray): ByteArray?
+}
+
+/** Production [SigningPayloadProvider] backed by UniFFI's `parse_challenge`. */
+public class UniffiSigningPayloadProvider : SigningPayloadProvider {
+    override fun signingPayloadFor(bondKey: ByteArray, frameBytes: ByteArray): ByteArray? =
+        try {
+            uniffi.deunlock_mobile.parseChallenge(bondKey, frameBytes).signPayload
+        } catch (t: Throwable) {
+            null
+        }
+}
+
 public fun interface ChallengeVerifier {
     /**
      * Verify [frameBytes] under [bondKey]. Returns the verified
@@ -381,12 +414,15 @@ public class DeUnlockCompanionService : Service() {
                 peerId = bond.peerId,
                 deviceMac = bond.peerId,
                 onChallenge = { peerId, frameBytes ->
-                    val challengeBody = if (frameBytes.size > 16) {
-                        frameBytes.copyOfRange(0, frameBytes.size - 16)
+                    val signingPayload = signingPayloadFor(peerId, frameBytes)
+                    if (signingPayload == null) {
+                        Log.w(
+                            DEUNLOCK_BG_LOG_TAG,
+                            "challenge dropped: no signing payload peer=$peerId (unknown bond, bad MAC, or unsupported wire version)",
+                        )
                     } else {
-                        frameBytes
+                        launchApprovalActivity(appContext, peerId, signingPayload)
                     }
-                    launchApprovalActivity(appContext, peerId, challengeBody)
                 },
             )
             PersistentGattClientRegistry.put(bond.peerId, client)
@@ -572,6 +608,21 @@ public class DeUnlockCompanionService : Service() {
          * `showWhenLocked` / `turnScreenOn` manifest attributes wake
          * the screen over the keyguard.
          */
+        /**
+         * Resolve the bytes the phone signs for [frameBytes] under the bond of
+         * [peerId], or `null` when this phone must not answer at all.
+         */
+        internal fun signingPayloadFor(peerId: String, frameBytes: ByteArray): ByteArray? {
+            val bondKey = bondKeyProvider?.bondKeyFor(peerId) ?: return null
+            return signingPayloadProvider.signingPayloadFor(bondKey, frameBytes)
+        }
+
+        /**
+         * Seam for the v2 signing payload (see [SigningPayloadProvider]).
+         * Replaced in JVM tests, where the UniFFI native library is absent.
+         */
+        public var signingPayloadProvider: SigningPayloadProvider = UniffiSigningPayloadProvider()
+
         public fun launchApprovalActivity(
             context: Context,
             peerId: String,

@@ -470,20 +470,23 @@ class MainActivity : FragmentActivity() {
                 peerId = bond.peerId,
                 deviceMac = bond.peerId,
                 onChallenge = { peerId, frameBytes ->
-                    // Strip the trailing 16-byte MAC tag so the
-                    // signature is computed over the frame body only
-                    // (version || nonce || payload), matching the
-                    // daemon's verify_frame(body_bytes) contract.
-                    val challengeBody = if (frameBytes.size > 16) {
-                        frameBytes.copyOfRange(0, frameBytes.size - 16)
+                    // v2 signs an auth transcript, not the frame body: the
+                    // signing payload comes from the Rust parser so the phone
+                    // and the desktop cannot disagree about what was signed.
+                    val signingPayload =
+                        DeUnlockCompanionService.signingPayloadFor(peerId, frameBytes)
+                    if (signingPayload == null) {
+                        android.util.Log.w(
+                            "deunlock.main",
+                            "challenge dropped: no signing payload peer=$peerId",
+                        )
                     } else {
-                        frameBytes
+                        DeUnlockCompanionService.launchApprovalActivity(
+                            applicationContext,
+                            peerId,
+                            signingPayload,
+                        )
                     }
-                    DeUnlockCompanionService.launchApprovalActivity(
-                        applicationContext,
-                        peerId,
-                        challengeBody,
-                    )
                 },
             )
             PersistentGattClientRegistry.put(bond.peerId, client)

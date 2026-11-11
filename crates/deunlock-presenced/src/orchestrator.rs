@@ -102,12 +102,22 @@ pub(crate) const RELOAD_TRIGGER_TEST: &str = "test";
 /// produces.
 pub const RELOAD_CHANNEL_CAPACITY: usize = 16;
 
-/// Default deadline for [`Orchestrator::issue_challenge`]. SPEC §4.3:
-/// "Offline-detect latency (daemon socket up, phone unreachable):
-/// ≤ 1.2 s per SPEC §4.3". The PAM caller falls through to FIDO
-/// when this deadline elapses without a response on the
-/// per-peer response characteristic.
-pub const DEFAULT_AUTH_TIMEOUT: StdDuration = StdDuration::from_millis(8000);
+/// Default deadline for [`Orchestrator::issue_challenge`].
+///
+/// This is **not** the offline-detection budget. SPEC §4.3's "≤ 1.2 s
+/// offline detect" is satisfied structurally: a peer that is not connected has
+/// no characteristic to write to, so `notify_challenge` fails immediately and
+/// the caller never waits out this deadline.
+///
+/// What this deadline actually bounds is a *human* answering a *biometric
+/// prompt*. Measured end to end on a real phone (Redmi, HyperOS 3, Android 16):
+/// challenge written at 09:14:41.96, phone's response characteristic written at
+/// 09:14:51.06 — 9.1 s for notification → screen wake → fingerprint → signature.
+/// The original 8 s expired 1.1 s before a perfectly good approval arrived, so
+/// `pamtester` reported `response-timeout` twice in a row while the operator was
+/// doing exactly the right thing. 25 s leaves room for a slow finger without
+/// making an unattended prompt hang the caller for a minute.
+pub const DEFAULT_AUTH_TIMEOUT: StdDuration = StdDuration::from_millis(25_000);
 
 /// Width in bytes of the per-challenge nonce. The value matches
 /// `deunlock_core::NONCE_LEN` (SPEC §3 scope item #6); the constant
@@ -1151,6 +1161,22 @@ impl Orchestrator {
             None => verify_frame(&verifying_key, &challenge, &signature),
         };
         if verified.is_err() {
+            // A bad signature is the one failure that cannot be diagnosed from
+            // counts alone: it means the desktop and the phone disagree about
+            // *what* was signed or *which key* signed it, and the two cases look
+            // identical from here. Dump the exact operands — fixed nonces are
+            // not secret, the payload is already on the wire, and without them
+            // every attempt costs a human fingerprint.
+            tracing::warn!(
+                peer_id,
+                signature = %hex::encode(signature.to_bytes()),
+                pubkey = %hex::encode(peer_state.phone_pubkey),
+                payload = %hex::encode(match &transcript {
+                    Some(t) => t.encode(),
+                    None => challenge.body_bytes().unwrap_or_default(),
+                }),
+                "bad signature: operands dumped for offline comparison"
+            );
             let t_end_ms = epoch_millis(SystemTime::now());
             self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_BAD_SIGNATURE)
                 .await;

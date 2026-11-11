@@ -77,7 +77,15 @@ pub const DAEMON_WRITE_TIMEOUT: Duration = Duration::from_millis(50);
 /// belt-and-suspenders fallback for the case where the daemon does
 /// not respect its own deadline. 8000 ms accommodates real
 /// BiometricPrompt reaction time on the phone (~4-5s typical).
-pub const DAEMON_RESPONSE_BUDGET: Duration = Duration::from_millis(8_000);
+/// Hard ceiling on how long a single challenge round trip may hold the PAM
+/// stack. It must stay *above* the daemon's own auth deadline
+/// (`deunlock_presenced::DEFAULT_AUTH_TIMEOUT`, 25 s): the daemon answers
+/// `response-timeout` itself, and that typed answer is worth having. When this
+/// budget was 8 s it silently truncated the caller's `auth_timeout` through
+/// `auth_timeout.min(DAEMON_RESPONSE_BUDGET)`, so a phone that answered in
+/// 9.1 s — a perfectly ordinary fingerprint — read as `PAM_AUTHINFO_UNAVAIL`
+/// while the daemon was still waiting for it.
+pub const DAEMON_RESPONSE_BUDGET: Duration = Duration::from_millis(30_000);
 
 /// Wall-clock slack added to [`DAEMON_CONNECT_TIMEOUT`] when the
 /// daemon-down test measures "≤ 50 ms". Process scheduling under
@@ -1059,7 +1067,7 @@ mod tests {
     fn daemon_constants_match_spec() {
         assert_eq!(DAEMON_CONNECT_TIMEOUT, Duration::from_millis(50));
         assert_eq!(DAEMON_WRITE_TIMEOUT, Duration::from_millis(50));
-        assert_eq!(DAEMON_RESPONSE_BUDGET, Duration::from_millis(8_000));
+        assert_eq!(DAEMON_RESPONSE_BUDGET, Duration::from_millis(30_000));
     }
 
     /// Reason-token round-trip: every constant we re-export from

@@ -36,7 +36,7 @@ pub const DEFAULT_BOND_DIR: &str = "/var/lib/deunlock";
 /// `time::timeout` trips first; the PAM-side budget is a
 /// belt-and-suspenders fallback. 8000 ms accommodates real
 /// BiometricPrompt reaction time on the phone (~4-5s typical).
-pub const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_millis(8_000);
+pub const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_millis(27_000);
 
 /// Name of the file appended to under [`Config::bond_dir`] on every
 /// `authenticate` call.
@@ -64,6 +64,16 @@ pub const DEFAULT_SOCKET_BASENAME: &str = "auth.sock";
 /// `socket=<path>` argument (SPEC §3 scope item #12). Anchored as a
 /// constant so the parser and the unit test grep the same literal.
 pub const PAM_SOCKET_ARG_PREFIX: &str = "socket=";
+
+/// Prefix the PAM module recognises for a per-service auth deadline in
+/// milliseconds (`timeout=25000`). Values below [`MIN_AUTH_TIMEOUT_MS`] are
+/// ignored: a stack that asks for a 200 ms window would only ever produce
+/// `response-timeout`, which reads as a broken module rather than a typo.
+pub const PAM_TIMEOUT_ARG_PREFIX: &str = "timeout=";
+
+/// Floor for an operator-supplied `timeout=`. The biometric prompt alone costs
+/// several seconds on a real phone.
+pub const MIN_AUTH_TIMEOUT_MS: u64 = 1_000;
 
 /// Runtime configuration consumed by [`crate::auth::authenticate`].
 ///
@@ -114,10 +124,20 @@ impl Config {
             .iter()
             .find_map(|arg| arg.strip_prefix(PAM_SOCKET_ARG_PREFIX))
             .map(PathBuf::from);
+        // `timeout=<ms>` lets an operator give a slow phone more room without
+        // rebuilding the module. It must stay *above* the daemon's own
+        // deadline, otherwise PAM gives up while the daemon is still waiting
+        // for a legitimately slow approval.
+        let auth_timeout = argv
+            .iter()
+            .find_map(|arg| arg.strip_prefix(PAM_TIMEOUT_ARG_PREFIX))
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|ms| *ms >= MIN_AUTH_TIMEOUT_MS)
+            .map_or(DEFAULT_AUTH_TIMEOUT, Duration::from_millis);
         Self {
             bond_dir: PathBuf::from(DEFAULT_BOND_DIR),
             socket_path: Self::resolve_socket_path(socket_override),
-            auth_timeout: DEFAULT_AUTH_TIMEOUT,
+            auth_timeout,
             test_fixed_nonce: None,
         }
     }
@@ -236,7 +256,7 @@ mod tests {
     /// Sanity: default timeout matches the SPEC §4.3 budget.
     #[test]
     fn default_auth_timeout_matches_spec_offline_budget() {
-        assert_eq!(DEFAULT_AUTH_TIMEOUT, Duration::from_millis(8_000));
+        assert_eq!(DEFAULT_AUTH_TIMEOUT, Duration::from_millis(27_000));
     }
 
     /// Sanity: default bond dir matches SPEC §4.4.

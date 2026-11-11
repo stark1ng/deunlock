@@ -445,3 +445,72 @@ retried zero times and treated the error as fatal: `transport_ready` went false
 on the first failure, the run loop drained, and the process exited — two seconds
 after a successful bond. Rotations now retry five times with a 60 ms backoff,
 and readiness only drops after three consecutive failed ticks.
+
+## Первая живая разблокировка: `pamtester: successfully authenticated`
+
+End-to-end on the real phone, through a real PAM stack
+(`/etc/pam.d/deunlock-test` → `pam_deunlock.so` → daemon → BLE → fingerprint):
+
+```
+pamtester: successfully authenticated
+tx peer=a4343c2dd72d042277a4120d64fdd24a outcome=ok  (4.1 s)
+```
+
+Getting there exposed four defects, each of which produced the same useless
+symptom — `bad-signature` or `response-timeout` — while the operator was doing
+exactly the right thing.
+
+### D-11 (high) — the phone signed the frame body; v2 verifies a transcript
+
+The approval path (`ChallengeApprovalActivity` → `AndroidBiometricGate`) stripped
+a 16-byte tag and signed `version ‖ nonce ‖ payload`:
+
+```kotlin
+val challengeBody = frameBytes.copyOfRange(0, frameBytes.size - 16)
+```
+
+That is the v1 contract (`verify_frame`). Since v2 the desktop verifies
+`AuthTranscript` (D-04), so the signature was valid and over the wrong bytes —
+indistinguishable, from the daemon's side, from a wrong key. Two earlier rounds
+were wasted on the key hypothesis before the operands were dumped and checked
+offline.
+
+The signing bytes now come from the same Rust parser the desktop's transcript
+comes from: `parseChallenge(bondKey, frameBytes).signPayload` — MAC-checked
+first, so "sign before authenticating the frame" is no longer expressible. A
+`SigningPayloadProvider` seam keeps JVM tests off the native library.
+
+### D-12 (high) — the daemon's deadline was capped in the PAM module
+
+```rust
+stream.set_read_timeout(Some(auth_timeout.min(DAEMON_RESPONSE_BUDGET)))  // 8_000
+```
+
+`DAEMON_RESPONSE_BUDGET` silently truncated the raised `auth_timeout`: the daemon
+waited 25 s while PAM gave up at 8. The budget is now 30 s and documented as
+"must exceed the daemon's deadline" — the daemon's typed `response-timeout`
+answer is worth waiting for.
+
+### D-13 (medium) — eight seconds is not enough for a fingerprint
+
+Measured on the device: challenge written, phone's response characteristic
+written **9.1 s later** — notification, screen wake, biometric prompt, signature.
+The old 8 s expired 1.1 s before a legitimate approval; a second attempt showed
+the same. `DEFAULT_AUTH_TIMEOUT` is now 25 s (daemon) / 27 s (PAM), and PAM
+accepts `timeout=<ms>` so an operator can tune a slow device without rebuilding
+the module. SPEC §4.3's "≤1.2 s offline detect" is unaffected and structural: an
+unreachable peer has no characteristic to write to, so the call fails in 0 ms
+(observed live: `outcome=transport-error` with `t_start_ms == t_end_ms`).
+
+### D-14 (high) — `revoke` is one-sided
+
+`revoke` in the app deletes the phone's bond record only. The desktop keeps
+its row in `/var/lib/deunlock/bonds.toml`, so it continues to challenge a device
+that no longer holds the key — and, because D-09 makes pair mode exclusive to
+"no bonds", it also stops advertising itself as pairable. The user-visible
+result was "the computer is not in the list" with a perfectly healthy daemon.
+
+Open. Candidate fixes: have the phone send a revoke frame over the authenticated
+channel; let the desktop drop a bond after N consecutive transport failures; or
+make desktop-side `deunlock revoke` the documented step and surface it in the
+app. Whichever wins, the two stores must not be able to disagree silently.

@@ -67,6 +67,7 @@ public class KeystoreFrameSigner(public val alias: String) : FrameSigner {
     override fun sign(message: ByteArray): ByteArray {
         return try {
             val key = openPrivateKey()
+            logSigningKey(key)
             val signature = Signature.getInstance(ED25519_SIGNATURE_ALGORITHM)
             signature.initSign(key)
             signature.update(message)
@@ -89,6 +90,35 @@ public class KeystoreFrameSigner(public val alias: String) : FrameSigner {
             ?: throw KeystoreFrameSignerError.AliasMissing(alias)
         return entry as? PrivateKey
             ?: throw KeystoreFrameSignerError.NotAPrivateKey(alias)
+    }
+
+    /**
+     * Dump the alias and the public half of the key that is about to sign.
+     *
+     * The desktop verifies the signature against the pubkey the phone sent at
+     * pair time, and a mismatch there is indistinguishable — from either side —
+     * from `what was signed` being wrong. Two pairings mint two Keystore
+     * entries under two aliases (the alias carries the BLE address, which
+     * Android randomises), so the only way to tell which key actually signs is
+     * to print it. The public key is not a secret; the private half never
+     * leaves the Keystore.
+     */
+    private fun logSigningKey(key: PrivateKey) {
+        val hex = try {
+            val keystore = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
+            val cert = keystore.getCertificate(alias)
+            val encoded = cert?.publicKey?.encoded
+            encoded?.joinToString("") { "%02x".format(it) } ?: "no-certificate"
+        } catch (e: java.security.GeneralSecurityException) {
+            "cert-read-failed:${e.message}"
+        }
+        android.util.Log.i(
+            KEYSTORE_SIGNER_LOG_TAG,
+            "signing alias=$alias pubkey=$hex spkiLen=${hex.length / 2}",
+        )
+        if (key.algorithm != ED25519_SIGNATURE_ALGORITHM) {
+            android.util.Log.w(KEYSTORE_SIGNER_LOG_TAG, "signing key algorithm=${key.algorithm}")
+        }
     }
 
     private companion object {
