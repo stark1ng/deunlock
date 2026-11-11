@@ -542,6 +542,32 @@ pub fn parse_challenge(bond_key: Vec<u8>, frame_bytes: Vec<u8>) -> Result<Challe
     })
 }
 
+/// Build the frame that tells the desktop to retire this bond.
+///
+/// Sent instead of a signature when the operator revokes on the phone: the
+/// desktop verifies it under the bond key it already holds, deletes its half and
+/// stops challenging a device that no longer has the key (AUDIT-001 D-14). The
+/// phone cannot open a socket to the desktop, so revocation travels on the only
+/// channel it has — the response characteristic — and lands on the next contact.
+///
+/// # Errors
+///
+/// [`MobileError::BadFrame`] when `bond_key` is not 32 bytes: a truncated key
+/// would produce a frame the desktop rejects as forged.
+pub fn build_revoke(bond_key: Vec<u8>, timestamp_ms: u64) -> Result<Vec<u8>, MobileError> {
+    let key: [u8; BOND_KEY_BYTES] = bond_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| MobileError::BadFrame {
+            reason: format!(
+                "bond key must be {BOND_KEY_BYTES} bytes, got {}",
+                bond_key.len()
+            ),
+        })?;
+    let frame = deunlock_core::encode_revoke(&key, timestamp_ms);
+    Ok(frame)
+}
+
 /// Sign a challenge of either wire version and return the raw 64-byte Ed25519
 /// signature — the blob `pam_deunlock` reads back and verifies.
 ///
@@ -1044,6 +1070,30 @@ fn qr_inputs(secret: &[u8], host_id: &[u8], phone_pubkey: &[u8]) -> Result<QrInp
         });
     }
     Ok((secret, host, phone))
+}
+
+#[cfg(test)]
+mod revoke_tests {
+    use super::*;
+
+    #[test]
+    fn build_revoke_produces_a_frame_the_desktop_authenticates() {
+        let bond = [0x2Au8; BOND_KEY_BYTES];
+        let now = 1_794_400_000_000u64;
+        let frame = build_revoke(bond.to_vec(), now).expect("frame");
+        assert_eq!(frame.len(), deunlock_core::REVOKE_FRAME_LEN);
+        assert!(deunlock_core::is_revoke_frame(&frame));
+        assert_eq!(
+            deunlock_core::decode_revoke(&bond, &frame, now).expect("verify"),
+            now
+        );
+    }
+
+    #[test]
+    fn a_truncated_bond_key_is_refused_rather_than_signed_with() {
+        let err = build_revoke(vec![0u8; 16], 1).unwrap_err();
+        assert!(matches!(err, MobileError::BadFrame { .. }));
+    }
 }
 
 #[cfg(test)]

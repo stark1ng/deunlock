@@ -45,7 +45,7 @@ use nix::unistd::{Gid, Uid, fchown};
 use deunlock_core::{Bond, BondError, BondStatus, BondStore, NONCE_LEN, SIGNATURE_LEN};
 use deunlock_presenced::{
     OUTCOME_REASON_BAD_SIGNATURE, OUTCOME_REASON_BUSY, OUTCOME_REASON_DENIED, OUTCOME_REASON_OK, OUTCOME_REASON_REPLAY, OUTCOME_REASON_USER_DECLINED,
-    OUTCOME_REASON_RESPONSE_TIMEOUT, OUTCOME_REASON_TRANSPORT_ERROR, OUTCOME_REASON_UNKNOWN_PEER, Request, Response, read_frame_blocking,
+    OUTCOME_REASON_RESPONSE_TIMEOUT, OUTCOME_REASON_TRANSPORT_ERROR, OUTCOME_REASON_UNKNOWN_PEER, OUTCOME_REASON_BOND_REVOKED, Request, Response, read_frame_blocking,
     write_frame_blocking,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -246,6 +246,10 @@ pub fn outcome_reason_to_pam(reason: &str) -> (std::ffi::c_int, &'static str) {
         OUTCOME_REASON_RESPONSE_TIMEOUT => (PAM_AUTHINFO_UNAVAIL, OUTCOME_REASON_RESPONSE_TIMEOUT),
         OUTCOME_REASON_OFFLINE => (PAM_AUTHINFO_UNAVAIL, OUTCOME_REASON_OFFLINE),
         OUTCOME_REASON_BUSY => (PAM_AUTHINFO_UNAVAIL, OUTCOME_REASON_BUSY),
+        // The phone retired the bond during this attempt, so the desktop has
+        // nothing left to verify against. Fall through to the password and let
+        // the operator re-pair; this is not an attack (AUDIT-001 D-14).
+        OUTCOME_REASON_BOND_REVOKED => (PAM_AUTHINFO_UNAVAIL, OUTCOME_REASON_BOND_REVOKED),
         OUTCOME_REASON_UNKNOWN_PEER => (PAM_AUTHINFO_UNAVAIL, OUTCOME_REASON_UNKNOWN_PEER),
         OUTCOME_REASON_TRANSPORT_ERROR => (PAM_AUTHINFO_UNAVAIL, OUTCOME_REASON_TRANSPORT_ERROR),
         OUTCOME_REASON_ADAPTER_MISSING => (PAM_AUTHINFO_UNAVAIL, OUTCOME_REASON_ADAPTER_MISSING),
@@ -723,6 +727,7 @@ mod tests {
         assert_eq!(outcome_reason_to_pam(OUTCOME_REASON_RESPONSE_TIMEOUT).0, PAM_AUTHINFO_UNAVAIL);
         assert_eq!(outcome_reason_to_pam(OUTCOME_REASON_OFFLINE).0, PAM_AUTHINFO_UNAVAIL);
         assert_eq!(outcome_reason_to_pam(OUTCOME_REASON_BUSY).0, PAM_AUTHINFO_UNAVAIL);
+        assert_eq!(outcome_reason_to_pam(OUTCOME_REASON_BOND_REVOKED).0, PAM_AUTHINFO_UNAVAIL);
         assert_eq!(outcome_reason_to_pam(OUTCOME_REASON_UNKNOWN_PEER).0, PAM_AUTHINFO_UNAVAIL);
         assert_eq!(outcome_reason_to_pam(OUTCOME_REASON_TRANSPORT_ERROR).0, PAM_AUTHINFO_UNAVAIL);
         assert_eq!(outcome_reason_to_pam(OUTCOME_REASON_ADAPTER_MISSING).0, PAM_AUTHINFO_UNAVAIL);

@@ -29,6 +29,7 @@ pub mod kex;
 pub mod mac;
 pub mod replay;
 pub mod qr_pair;
+pub mod revoke;
 pub mod qr_pairing;
 pub mod secrets;
 pub mod sign;
@@ -77,3 +78,5 @@ pub use sign::{
     SIGNATURE_LEN, SIGNED_MESSAGE_PREFIX_LEN, Signature, SigningKey, VerifyError, VerifyingKey, sign_frame, sign_transcript, verify_frame,
     verify_transcript,
 };
+
+pub use revoke::{decode_revoke, encode_revoke, is_revoke_frame, RevokeError, REVOKE_FRAME_LEN};

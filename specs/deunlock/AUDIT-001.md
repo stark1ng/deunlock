@@ -514,3 +514,49 @@ Open. Candidate fixes: have the phone send a revoke frame over the authenticated
 channel; let the desktop drop a bond after N consecutive transport failures; or
 make desktop-side `deunlock revoke` the documented step and surface it in the
 app. Whichever wins, the two stores must not be able to disagree silently.
+
+### D-14 — протокол отзыва (desktop half, done)
+
+The phone cannot open a socket to the daemon; its only channel is the GATT
+response characteristic. So revocation travels there, and it is authenticated:
+
+```text
+"DLR1" ‖ timestamp_ms: u64 BE ‖ tag: [u8; 32]
+tag = BLAKE3_keyed(derive_auth_mac_key(bond), "deunlock-revoke-v1" ‖ timestamp_be)
+```
+
+The tag proves possession of the bond key the desktop already holds, so a
+stranger cannot retire somebody else's bond — the test
+`a_revocation_under_the_wrong_key_changes_nothing` pins exactly that: a forged
+frame leaves `bonds.toml`, the key file and the live peer untouched and is
+reported as `bad-signature`. A forged frame is therefore not a remote revoke
+gadget.
+
+On receipt the daemon does three things together, because doing fewer is how the
+two sides disagreed in the first place: removes the record from `bonds.toml`,
+deletes `keys/<peer_id>.bin`, and reloads the peer set so the GATT registration
+and the advertised UUIDs drop with it. The outcome is its own reason
+(`bond-revoked`), mapped by PAM to `PAM_AUTHINFO_UNAVAIL` so the password path
+still works and the operator is told to re-pair — instead of `bad-signature`,
+which says "your fingerprint did not match" when in truth the bond is gone.
+
+Timestamp window is ±10 minutes: revocation is idempotent, so the worst a
+captured frame can do is delay a re-pair, and only while it is fresh.
+
+**Still open — the phone half.** Delivering the frame needs the app to keep a
+tombstone for a revoked bond: today `onBondRevokeTapped` deletes the record and
+the Keystore entry, after which the service has no peer to attach a GATT client
+to and cannot answer the next challenge at all. Two shapes are possible and this
+needs a decision rather than a guess:
+
+1. *Tombstone until delivered* — keep the record, mark it `revoke-pending`, show
+   the home card as unpaired, and answer the next challenge with `DLR1` instead
+   of biometrics. Costs: a bond that outlives the operator's intent if the
+   desktop is never in range again.
+2. *Best effort now, expire later* — send `DLR1` immediately if the peer is
+   connected, delete the record regardless, and let the desktop bound the damage
+   with a staleness rule (drop a bond nobody has connected to for N days).
+
+Until one is chosen, the operator-facing path is `deunlock revoke <peer>` on the
+desktop: it marks the bond `Revoked`, the reload drops the peer, and pair mode
+returns — verified by `compute_new_set` filtering `is_revoked()`.

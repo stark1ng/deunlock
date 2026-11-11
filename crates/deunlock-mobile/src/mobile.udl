@@ -51,6 +51,11 @@ namespace deunlock_mobile {
   [Throws=MobileError]
   bytes build_response_signature(bytes bond_key, FrameSigner signer, bytes frame_bytes);
 
+  // Frame that retires this bond on the desktop. Sent instead of a signature when
+  // the operator revokes on the phone (AUDIT-001 D-14).
+  [Throws=MobileError]
+  bytes build_revoke(bytes bond_key, u64 timestamp_ms);
+
   // Derive the bond from a scanned QR pairing secret. The desktop derives the
   // same key after verifying the request, so it never crosses the network.
   [Throws=MobileError]

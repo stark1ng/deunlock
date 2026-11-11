@@ -90,6 +90,9 @@ pub const RELOAD_TRIGGER_INOTIFY: &str = "inotify";
 /// flow completed a new bond and asked the orchestrator to pick it up.
 pub const RELOAD_TRIGGER_PAIR: &str = "pair";
 
+/// Trigger recorded when the phone revoked its own bond over the unlock channel.
+pub const RELOAD_TRIGGER_REVOKED: &str = "revoked";
+
 /// Audit-line `trigger=` value emitted on the test-shim reload path.
 /// `pub(crate)` because no production caller should ever emit this
 /// trigger; the constant is only used by the in-process test seam
@@ -146,6 +149,11 @@ pub const OUTCOME_REASON_DENIED: &str = "denied";
 /// value it has always sent on Cancel, so no Android change is required for
 /// the desktop half to gain correct fallback semantics.
 pub const OUTCOME_REASON_USER_DECLINED: &str = "user-declined";
+
+/// The phone answered a challenge with a revocation frame instead of a
+/// signature (AUDIT-001 D-14). The bond has been dropped on this side; PAM maps
+/// this to `PAM_AUTHINFO_UNAVAIL` and the operator must re-pair.
+pub const OUTCOME_REASON_BOND_REVOKED: &str = "bond-revoked";
 
 /// `Response::Challenge { reason }` value emitted for the
 /// [`ChallengeOutcome::Replay`] branch. S-006 never produces this
@@ -288,6 +296,11 @@ pub enum ChallengeOutcome {
     /// S-007's deliverable. The variant exists so the wire-shape
     /// surface is stable across S-006 → S-007.
     Replay,
+    /// The phone answered with a revocation frame: the operator retired this
+    /// bond from the phone, and the desktop has now deleted its half. Distinct
+    /// from [`Self::BadSignature`] so the caller can say "re-pair" instead of
+    /// "that fingerprint did not match" (AUDIT-001 D-14).
+    BondRevoked,
     /// The response carried an Ed25519 signature whose strict
     /// verification (`VerifyingKey::verify_strict`) failed.
     BadSignature,
@@ -315,6 +328,7 @@ impl ChallengeOutcome {
             ChallengeOutcome::Denied => OUTCOME_REASON_DENIED,
             ChallengeOutcome::UserDeclined => OUTCOME_REASON_USER_DECLINED,
             ChallengeOutcome::Replay => OUTCOME_REASON_REPLAY,
+            ChallengeOutcome::BondRevoked => OUTCOME_REASON_BOND_REVOKED,
             ChallengeOutcome::BadSignature => OUTCOME_REASON_BAD_SIGNATURE,
             ChallengeOutcome::TimedOut => OUTCOME_REASON_RESPONSE_TIMEOUT,
             ChallengeOutcome::UnknownPeer => OUTCOME_REASON_UNKNOWN_PEER,
@@ -408,6 +422,9 @@ pub enum ReloadTrigger {
     /// orchestrator to reload. Distinct trigger so the audit line
     /// distinguishes "new pair" from "operator-driven reload".
     Pair,
+    /// The phone revoked its bond over the unlock channel, so the peer set
+    /// shrank because of something the phone did, not the operator here.
+    Revoked,
     /// In-process test seam (`Orchestrator::signal_reload_for_test`).
     /// Production callers cannot construct this variant by name —
     /// the constructor is `pub(crate)`.
@@ -423,6 +440,7 @@ impl ReloadTrigger {
             ReloadTrigger::Rpc => RELOAD_TRIGGER_RPC,
             ReloadTrigger::Inotify => RELOAD_TRIGGER_INOTIFY,
             ReloadTrigger::Pair => RELOAD_TRIGGER_PAIR,
+            ReloadTrigger::Revoked => RELOAD_TRIGGER_REVOKED,
             ReloadTrigger::Test => RELOAD_TRIGGER_TEST,
         }
     }
@@ -759,6 +777,35 @@ impl Orchestrator {
     async fn snapshot_peers(&self) -> Vec<(String, [u8; BOND_KEY_BYTES])> {
         let guard = self.peers.lock().await;
         guard.iter().map(|(id, entry)| (id.clone(), entry.bond_key)).collect()
+    }
+
+    /// Retire a bond that the phone has revoked.
+    ///
+    /// Three things must happen together or the two sides disagree again: the
+    /// record leaves `bonds.toml`, the per-peer key file is deleted, and the peer
+    /// set is reloaded so the GATT registration and the advertised UUIDs drop
+    /// with it. Failures are logged rather than propagated — the caller is
+    /// already inside an authentication attempt that will fail closed.
+    async fn drop_bond(&self, peer_id: &str) {
+        match BondStore::load(&self.bonds_file) {
+            Ok(mut store) => {
+                match store.remove(peer_id) {
+                    Ok(()) => match store.save(&self.bonds_file) {
+                        Ok(()) => tracing::info!(peer_id, "bond record removed"),
+                        Err(err) => tracing::warn!(peer_id, error = %err, "bond record save failed"),
+                    },
+                    Err(err) => tracing::warn!(peer_id, error = %err, "bond record removal failed"),
+                }
+            }
+            Err(err) => tracing::warn!(peer_id, error = %err, "bond store load failed during revoke"),
+        }
+        let key_path = self.keys_dir.join(format!("{peer_id}.bin"));
+        match std::fs::remove_file(&key_path) {
+            Ok(()) => tracing::info!(path = %key_path.display(), "bond key file removed"),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!(path = %key_path.display(), error = %err, "bond key removal failed"),
+        }
+        self.run_reload(ReloadTrigger::Revoked).await;
     }
 
     /// Re-read the `BondStore` from disk, diff against the live peer
@@ -1126,6 +1173,42 @@ impl Orchestrator {
                 return outcome;
             }
         };
+        // A revocation travels on the same characteristic as a signature,
+        // because that is the only channel the phone has (AUDIT-001 D-14). It is
+        // authenticated under the bond key we are about to delete, so a stranger
+        // cannot retire somebody else's bond.
+        if deunlock_core::is_revoke_frame(&response_bytes) {
+            match deunlock_core::decode_revoke(
+                &peer_state.bond_key,
+                &response_bytes,
+                u64::try_from(epoch_millis(SystemTime::now())).unwrap_or(u64::MAX),
+            ) {
+                Ok(frame_ms) => {
+                    tracing::warn!(
+                        peer_id,
+                        frame_ms,
+                        "phone revoked its bond; dropping the desktop half"
+                    );
+                    self.drop_bond(peer_id).await;
+                    let t_end_ms = epoch_millis(SystemTime::now());
+                    self.audit_at(
+                        peer_id,
+                        &nonce_hex,
+                        t_start_ms,
+                        t_end_ms,
+                        OUTCOME_REASON_BOND_REVOKED,
+                    )
+                    .await;
+                    return ChallengeOutcome::BondRevoked;
+                }
+                Err(err) => {
+                    // A frame that claims to be a revocation but does not
+                    // authenticate is an attack or a protocol mistake. Fall
+                    // through to signature parsing, which fails closed.
+                    tracing::warn!(peer_id, error = %err, "revocation frame rejected");
+                }
+            }
+        }
         let signature = match parse_signature(&response_bytes) {
             Some(s) => s,
             None => {
