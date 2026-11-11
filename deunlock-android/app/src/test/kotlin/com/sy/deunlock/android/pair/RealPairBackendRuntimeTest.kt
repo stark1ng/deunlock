@@ -44,8 +44,8 @@ import com.sy.deunlock.android.pair.impl.KeystoreKeygenError
 import com.sy.deunlock.android.pair.impl.PAIR_BOND_KEY_LEN
 import com.sy.deunlock.android.pair.impl.PAIR_PUBKEY_LEN
 import com.sy.deunlock.android.pair.impl.PAIRING_VARIANT_PASSKEY_CONFIRMATION
-import com.sy.deunlock.android.pair.impl.PairBondKeyDeriver
 import com.sy.deunlock.android.pair.impl.PairClock
+import com.sy.deunlock.android.pair.impl.PairWriteBuilder
 import com.sy.deunlock.android.pair.impl.PairCompanionScanner
 import com.sy.deunlock.android.pair.impl.PairGattExchange
 import com.sy.deunlock.android.pair.impl.PairSessionUuidLookup
@@ -120,21 +120,16 @@ private class RecordingReceiverRegistrar : ReceiverRegistrar {
     }
 }
 
-/** Returns a deterministic `bond_key` for any pair of pubkeys. */
-private class XorPairBondKeyDeriver : PairBondKeyDeriver {
-    override fun derive(hostPubkey: ByteArray, phonePubkey: ByteArray): ByteArray {
-        val out = ByteArray(PAIR_BOND_KEY_LEN)
-        for (i in 0 until PAIR_BOND_KEY_LEN) {
-            out[i] = (hostPubkey[i % hostPubkey.size].toInt() xor phonePubkey[i % phonePubkey.size].toInt()).toByte()
-        }
-        return out
-    }
-}
-
 /** Returns a canned 32-byte host pubkey; used by the DEV-002 runtime error-path tests. */
 private class CannedHostPubkeyExchange : PairGattExchange {
-    override fun exchangePubkeys(address: String, phonePubkey: ByteArray): ByteArray =
-        ByteArray(PAIR_PUBKEY_LEN) { (it + 0x40).toByte() }
+    override fun exchangeCodePairing(
+        address: String,
+        buildWrite: (hostPubkey: ByteArray) -> ByteArray,
+    ): ByteArray {
+        val host = ByteArray(PAIR_PUBKEY_LEN) { (it + 0x40).toByte() }
+        buildWrite(host)
+        return host
+    }
 }
 
 /** Returns a pre-built [KeystoreEd25519KeyMaterial] regardless of alias input. */
@@ -157,18 +152,42 @@ private class ThrowingKeystoreKeyGenerator(
     }
 }
 
+/**
+ * Stands in for the native builder: records the code it was handed and returns a
+ * frame of the real length, so the GATT fake sees the shape production writes.
+ */
+private class RecordingPairWriteBuilder : PairWriteBuilder {
+    val codes: MutableList<String> = mutableListOf()
+
+    override fun build(
+        code: String,
+        hostPubkey: ByteArray,
+        phonePubkey: ByteArray,
+        bond: ByteArray,
+    ): ByteArray {
+        codes += code
+        return ByteArray(101)
+    }
+}
+
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
 class RealPairBackendRuntimeTest {
     @Test fun duplicate_bond_callbacks_exchange_keys_once() {
         var exchanges = 0
         val exchange = object : PairGattExchange {
-            override fun exchangePubkeys(address: String, phonePubkey: ByteArray): ByteArray {
+            override fun exchangeCodePairing(
+                address: String,
+                buildWrite: (hostPubkey: ByteArray) -> ByteArray,
+            ): ByteArray {
                 exchanges += 1
-                return ByteArray(PAIR_PUBKEY_LEN)
+                val host = ByteArray(PAIR_PUBKEY_LEN)
+                buildWrite(host)
+                return host
             }
         }
         val backend = makeBackend(null, exchange, keystoreKeyGenerator = FixedKeystoreKeyGenerator())
+        backend.supplyPairingCode("7QK2M9XPDB")
         backend.runPostBondExchange(FIXTURE_PEER_ADDR)
         backend.runPostBondExchange(FIXTURE_PEER_ADDR)
         assertEquals(1, exchanges)
@@ -180,7 +199,6 @@ class RealPairBackendRuntimeTest {
         gattExchange: PairGattExchange?,
         pairingRegistrar: RecordingReceiverRegistrar = RecordingReceiverRegistrar(),
         bondStateRegistrar: RecordingReceiverRegistrar = RecordingReceiverRegistrar(),
-        bondKeyDeriver: PairBondKeyDeriver = XorPairBondKeyDeriver(),
         keystoreKeyGenerator: KeystoreKeyGenerator? = null,
     ): RealPairBackend = RealPairBackend(
         context = ApplicationProvider.getApplicationContext(),
@@ -191,7 +209,7 @@ class RealPairBackendRuntimeTest {
         bondStateReceiverRegistrar = bondStateRegistrar,
         clock = PairClock { FIXTURE_NOW_SECONDS },
         sessionUuidLookup = PairSessionUuidLookup(::lookupStub),
-        bondKeyDeriver = bondKeyDeriver,
+        pairWriteBuilder = RecordingPairWriteBuilder(),
         keystoreKeyGenerator = keystoreKeyGenerator,
     )
 
@@ -466,6 +484,9 @@ class RealPairBackendRuntimeTest {
             gattExchange = CannedHostPubkeyExchange(),
             keystoreKeyGenerator = generator,
         )
+        // A code is mandatory now: without it the desktop refuses the write and
+        // the backend says so before touching the radio (AUDIT-001 D-08).
+        backend.supplyPairingCode("7QK2M9XPDB")
         backend.runPostBondExchange(FIXTURE_PEER_ADDR)
         val result = backend.awaitLescResult()
         assertTrue("expected Bonded, got $result", result is LescResult.Bonded)

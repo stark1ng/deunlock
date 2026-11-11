@@ -669,3 +669,50 @@ asked. It does now, and `advertising` is `Option<bool>`: `true`, `false`, or
 `unknown` when the daemon is down or predates the field. A diagnostic surface
 must be allowed to say "I do not know" — that is a different, and much more
 useful, answer than a constant.
+
+### D-08 (high) — the first bond needed nothing but a nearby phone, CLOSED
+
+Two halves of one defect.
+
+**The bond key was public.** `bond = HKDF(host_pubkey ‖ phone_pubkey)` — no salt,
+no secret. `phone_pubkey` is public by construction (it is peer_id's preimage and
+travels in every Hello), and `host_pubkey` is written onto the pair
+characteristic the phone reads. Anyone who knew both could compute the bond of a
+phone they had never touched.
+
+**Nobody was in the loop.** The pair service is registered whenever a desktop has
+zero bonds, which is exactly the state a fresh install sits in. It accepted
+whichever phone wrote first, at any hour, with no operator action and no expiry.
+
+Fix, and why this shape:
+
+- `deunlock pair-code` mints a single-use ten-character code (Crockford base32,
+  no `I`/`L`/`O`/`U`), arms an offer file with a 5-minute expiry, and prints it.
+- The phone reads the host pubkey off the pair characteristic, generates its own
+  random 256-bit bond, and writes `DLPB1 ‖ phone_pubkey ‖ tag ‖ bond`, where
+  `tag = KDF(code, host_pubkey ‖ phone_pubkey ‖ bond)`.
+- The desktop verifies the tag against the armed offer, spends the offer, and
+  stores the phone's bond.
+
+The code authenticates the handshake; it is **not** the key. Fifty bits is a
+reasonable one-shot gesture and a terrible long-lived secret, so the bond stays
+random and is never derived from the code. The bond is in the tag input, so a
+relayed write cannot carry a substitute bond.
+
+Refusals are distinct so the phone-side failure is diagnosable: no offer, expired
+offer, QR-only offer, wrong code (counted, five attempts kill the offer), bond
+swapped after signing, and the legacy 32-byte pubkey-only write (`NoCodeProof`) —
+the shape that made the hole.
+
+Phone half: a code field on the pairing screen, the code handed to the backend,
+the frame built by the same Rust code the desktop verifies (`build_pair_write`
+over UniFFI), and a plain refusal before any radio traffic when the code is empty.
+
+Tests: `deunlock-core` code/tag/frame vectors; six verifier tests in
+`runtime.rs` (accept-and-spend, wrong code counted, no offer, QR offer, five
+strikes, swapped bond); Kotlin handover tests. Workspace 632 passed, clippy clean.
+
+Still open on this front: a phone that has never been told the code can connect and
+*write* — it just cannot produce a valid tag, so the desktop refuses it. That is
+the intended shape, but it means the pair characteristic is a free attack surface
+for garbage writes; a rate limit per BLE address is not implemented.

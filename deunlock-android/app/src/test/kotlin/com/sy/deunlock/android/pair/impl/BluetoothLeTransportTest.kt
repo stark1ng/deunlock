@@ -43,7 +43,7 @@ class BluetoothLeTransportTest {
     @Test
     fun pairing_exchange_explicitly_uses_ble() {
         val request = assertThrows(GattConnectionRequested::class.java) {
-            AndroidPairGattExchange(context, adapter).exchangePubkeys(address, ByteArray(32))
+            AndroidPairGattExchange(context, adapter).exchangeCodePairing(address) { ByteArray(101) }
         }
         assertEquals(BluetoothDevice.TRANSPORT_LE, request.transport)
         assertEquals(false, request.autoConnect)

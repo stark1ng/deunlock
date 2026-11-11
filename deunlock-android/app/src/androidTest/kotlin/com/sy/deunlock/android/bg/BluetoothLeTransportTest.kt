@@ -38,7 +38,7 @@ class BluetoothLeTransportTest {
         assertTrue("Enable emulator Bluetooth before the test", adapter.isEnabled)
         val phonePubkey = ByteArray(32) { it.toByte() }
         val hostPubkey = ByteArray(32) { (31 - it).toByte() }
-        assertArrayEquals(hostPubkey, AndroidPairGattExchange(context, adapter).exchangePubkeys(address!!, phonePubkey))
+        assertArrayEquals(hostPubkey, AndroidPairGattExchange(context, adapter).exchangeCodePairing(address!!) { phonePubkey })
 
         val received = CountDownLatch(1)
         val frame = AtomicReference<ByteArray>()

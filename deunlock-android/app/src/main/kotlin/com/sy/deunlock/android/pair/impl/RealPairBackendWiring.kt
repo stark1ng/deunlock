@@ -47,9 +47,13 @@ public val DEUNLOCK_PAIR_PHONE_PUBKEY_CHAR_UUID: UUID = UUID.fromString("5a4e8e3
 public const val PAIR_GATT_EXCHANGE_TIMEOUT_SECS: Long = 30L
 
 /** Exchange against a pair service whose phone-key write completes pairing. */
-internal fun exchangePairPubkeys(readHost: () -> ByteArray, writePhone: () -> Unit): ByteArray {
+internal fun exchangeCodePairingFrame(
+    readHost: () -> ByteArray,
+    buildWrite: (ByteArray) -> ByteArray,
+    writePhone: (ByteArray) -> Unit,
+): ByteArray {
     val host = readHost()
-    writePhone()
+    writePhone(buildWrite(host))
     return host
 }
 
@@ -88,57 +92,6 @@ public class UniffiPairSessionUuidLookup : PairSessionUuidLookup {
 }
 
 /**
- * Production [PairBondKeyDeriver]. Mirrors
- * `deunlock_core::bond_key_from_pubkeys` byte-for-byte:
- *
- *   bond_key = HKDF-SHA256(salt=None,
- *                           ikm = host_pubkey || phone_pubkey,
- *                           info = "deunlock-bond-v1")[0..32]
- *
- * Implemented in pure JVM crypto so the runtime does not need to
- * cross the UniFFI boundary for this single derivation.
- */
-public class HkdfPairBondKeyDeriver : PairBondKeyDeriver {
-
-    override fun derive(hostPubkey: ByteArray, phonePubkey: ByteArray): ByteArray {
-        val ikm = ByteArray(hostPubkey.size + phonePubkey.size)
-        System.arraycopy(hostPubkey, 0, ikm, 0, hostPubkey.size)
-        System.arraycopy(phonePubkey, 0, ikm, hostPubkey.size, phonePubkey.size)
-        return hkdfSha256(ikm = ikm, info = BOND_HKDF_INFO_V1, length = PAIR_BOND_KEY_LEN)
-    }
-
-    private fun hkdfSha256(ikm: ByteArray, info: ByteArray, length: Int): ByteArray {
-        val mac = javax.crypto.Mac.getInstance(HMAC_ALG)
-        val zeroSalt = ByteArray(MessageDigest.getInstance(SHA256_ALG).digestLength)
-        mac.init(javax.crypto.spec.SecretKeySpec(zeroSalt, HMAC_ALG))
-        val prk = mac.doFinal(ikm)
-        // expand: T(1) = HMAC(prk, info || 0x01); concat until length.
-        val out = ByteArray(length)
-        var written = 0
-        var prev = ByteArray(0)
-        var counter = 1
-        while (written < length) {
-            mac.init(javax.crypto.spec.SecretKeySpec(prk, HMAC_ALG))
-            mac.update(prev)
-            mac.update(info)
-            mac.update(counter.toByte())
-            prev = mac.doFinal()
-            val take = minOf(prev.size, length - written)
-            System.arraycopy(prev, 0, out, written, take)
-            written += take
-            counter += 1
-        }
-        return out
-    }
-
-    private companion object {
-        const val HMAC_ALG: String = "HmacSHA256"
-        const val SHA256_ALG: String = "SHA-256"
-        val BOND_HKDF_INFO_V1: ByteArray = "deunlock-bond-v1".toByteArray(Charsets.US_ASCII)
-    }
-}
-
-/**
  * Production [PairGattExchange] wrapping
  * `BluetoothDevice.connectGatt(...)`. Used by [RealPairBackend] after
  * `BOND_BONDED` lands; opens a fresh GATT client connection to the
@@ -148,7 +101,7 @@ public class HkdfPairBondKeyDeriver : PairBondKeyDeriver {
  *
  * The implementation uses blocking `CountDownLatch`-driven callbacks
  * because the [PairBackend] surface is synchronous. The backend
- * already calls [PairGattExchange.exchangePubkeys] from a coroutine
+ * already calls [PairGattExchange.exchangeCodePairing] from a coroutine
  * pumped via `awaitLescResult` -> `runBlocking`, so the blocking is
  * intentional and bounded by [PAIR_GATT_EXCHANGE_TIMEOUT_SECS].
  */
@@ -157,7 +110,10 @@ public class AndroidPairGattExchange(
     private val adapter: BluetoothAdapter,
 ) : PairGattExchange {
 
-    override fun exchangePubkeys(address: String, phonePubkey: ByteArray): ByteArray {
+    override fun exchangeCodePairing(
+        address: String,
+        buildWrite: (hostPubkey: ByteArray) -> ByteArray,
+    ): ByteArray {
         val device = adapter.getRemoteDevice(address)
         val servicesDiscovered = CountDownLatch(1)
         val writeDone = CountDownLatch(1)
@@ -224,7 +180,7 @@ public class AndroidPairGattExchange(
                 ?: throw RuntimeException("phone-pubkey characteristic missing")
             val hostChar = service.getCharacteristic(DEUNLOCK_PAIR_HOST_PUBKEY_CHAR_UUID)
                 ?: throw RuntimeException("host-pubkey characteristic missing")
-            return exchangePairPubkeys(readHost = {
+            return exchangeCodePairingFrame(readHost = {
                 if (!gatt.readCharacteristic(hostChar)) {
                     throw RuntimeException("host-pubkey readCharacteristic refused")
                 }
@@ -233,8 +189,8 @@ public class AndroidPairGattExchange(
                 }
                 failure.get()?.let { throw RuntimeException(it) }
                 hostPubkey.get() ?: throw RuntimeException("host-pubkey read returned null")
-            }, writePhone = {
-                phoneChar.value = phonePubkey
+            }, buildWrite = buildWrite, writePhone = { frame ->
+                phoneChar.value = frame
                 if (!gatt.writeCharacteristic(phoneChar)) {
                     throw RuntimeException("phone-pubkey writeCharacteristic refused")
                 }

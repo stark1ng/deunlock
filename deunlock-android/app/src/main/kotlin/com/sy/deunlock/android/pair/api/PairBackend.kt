@@ -116,4 +116,15 @@ interface PairBackend {
      * observes the system bond state; tests resolve this synchronously.
      */
     fun awaitLescResult(): LescResult
+
+    /**
+     * Hand over the code the operator read off the desktop.
+     *
+     * The first bond now needs it: the phone proves it was given a secret that
+     * never crossed the air (AUDIT-001 D-08). Default no-op so a fake backend in
+     * a test that does not exercise pairing does not have to implement it.
+     */
+    fun supplyPairingCode(code: String) {
+        // Default: ignored.
+    }
 }

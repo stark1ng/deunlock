@@ -59,6 +59,7 @@
 pub mod implementation;
 
 pub use implementation::{
+    build_pair_write,
     build_revoke,
     ED25519_SECRET_KEY_LEN, ED25519_SIGNATURE_LEN, FrameSigner, HKDF_INFO_OOB_V1, HKDF_INFO_SESSION_V1, INVITE_PUBKEY_LEN,
     INVITE_QUERY_KEY_HOST, INVITE_QUERY_KEY_PUBKEY, INVITE_URI_HOST_PATH, INVITE_URI_SCHEME, Invite, MOBILE_BOND_KEY_LEN, MobileError,

@@ -56,6 +56,9 @@ namespace deunlock_mobile {
   [Throws=MobileError]
   bytes build_revoke(bytes bond_key, u64 timestamp_ms);
 
+  [Throws=MobileError]
+  bytes build_pair_write(string code, bytes host_pubkey, bytes phone_pubkey, bytes bond);
+
   // Derive the bond from a scanned QR pairing secret. The desktop derives the
   // same key after verifying the request, so it never crosses the network.
   [Throws=MobileError]

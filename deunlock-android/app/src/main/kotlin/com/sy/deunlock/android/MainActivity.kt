@@ -728,8 +728,11 @@ private fun DeUnlockApp(
             }
             val viewModel: PairingViewModel = viewModel(factory = factory)
             val state by viewModel.state.collectAsState()
+            val pairingCode by viewModel.pairingCode.collectAsState()
             PairingScreen(
                 state = state,
+                code = pairingCode,
+                onCodeChanged = viewModel::onPairingCodeChanged,
                 onStartScan = viewModel::onStartScanTapped,
                 onCancel = viewModel::onCancelTapped,
                 onOobYes = viewModel::onOobYesTapped,
@@ -1144,7 +1147,6 @@ private object PairingViewModelFactoryHolder {
                     bondStateReceiverRegistrar = com.sy.deunlock.android.pair.impl.ContextReceiverRegistrar(context),
                     clock = com.sy.deunlock.android.pair.impl.SystemPairClock(),
                     sessionUuidLookup = com.sy.deunlock.android.pair.impl.UniffiPairSessionUuidLookup(),
-                    bondKeyDeriver = com.sy.deunlock.android.pair.impl.HkdfPairBondKeyDeriver(),
                     keystoreKeyGenerator = keystoreGenerator,
                 )
                 val vm = PairingViewModel(

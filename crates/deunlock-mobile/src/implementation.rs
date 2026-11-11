@@ -568,6 +568,60 @@ pub fn build_revoke(bond_key: Vec<u8>, timestamp_ms: u64) -> Result<Vec<u8>, Mob
     Ok(frame)
 }
 
+/// Build the BLE pairing write: the phone's half of a code-authenticated
+/// first bond (AUDIT-001 D-08).
+///
+/// The phone reads the host pubkey off the pair characteristic, generates its own
+/// 256-bit bond, and tags `(code, host_pubkey, phone_pubkey, bond)`. The desktop
+/// verifies the tag against the code the operator typed in and stores `bond` as
+/// the shared key. Signing this in Rust keeps one implementation of the bytes —
+/// the same rule that made the unlock transcript work.
+///
+/// # Errors
+///
+/// [`MobileError::BadFrame`] when a fixed-length operand is the wrong size, or
+/// when `code` is not a pairing code.
+pub fn build_pair_write(
+    code: String,
+    host_pubkey: Vec<u8>,
+    phone_pubkey: Vec<u8>,
+    bond: Vec<u8>,
+) -> Result<Vec<u8>, MobileError> {
+    let host: [u8; 32] = host_pubkey
+        .as_slice()
+        .try_into()
+        .map_err(|_| MobileError::BadFrame {
+            reason: format!("host pubkey must be 32 bytes, got {}", host_pubkey.len()),
+        })?;
+    let phone: [u8; 32] = phone_pubkey
+        .as_slice()
+        .try_into()
+        .map_err(|_| MobileError::BadFrame {
+            reason: format!("phone pubkey must be 32 bytes, got {}", phone_pubkey.len()),
+        })?;
+    let bond: [u8; deunlock_core::PAIR_BOND_BYTES] =
+        bond.as_slice()
+            .try_into()
+            .map_err(|_| MobileError::BadFrame {
+                reason: format!(
+                    "bond must be {} bytes, got {}",
+                    deunlock_core::PAIR_BOND_BYTES,
+                    bond.len()
+                ),
+            })?;
+    let tag = deunlock_core::pair_code_tag(&code, &host, &phone, &bond).map_err(|err| {
+        MobileError::BadFrame {
+            reason: format!("{err}"),
+        }
+    })?;
+    Ok(deunlock_core::PairWrite {
+        phone_pubkey: phone,
+        tag,
+        bond,
+    }
+    .encode())
+}
+
 /// Sign a challenge of either wire version and return the raw 64-byte Ed25519
 /// signature — the blob `pam_deunlock` reads back and verifies.
 ///

@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -39,6 +40,7 @@ import androidx.compose.ui.unit.dp
  * Test tags. Public so [PairingScreenTest] can use the same constants.
  */
 object PairingTestTags {
+    const val CODE_FIELD: String = "pairing-code-field"
     const val IDLE_CTA: String = "pair.idle.cta"
     const val SCANNING_PROGRESS: String = "pair.scanning.progress"
     const val SCANNING_CANCEL: String = "pair.scanning.cancel"
@@ -56,6 +58,11 @@ object PairingTestTags {
 /** Static UI strings. Centralised so tests assert on the same constants. */
 object PairingStrings {
     const val IDLE_CTA: String = "Pair with computer"
+    const val CODE_LABEL: String = "Code from the computer"
+    const val CODE_HINT: String = "10 characters, from `deunlock pair-code`"
+    const val CODE_HELP: String =
+        "Run `deunlock pair-code` on the computer and type the code it shows. " +
+            "Without it this phone cannot pair."
     const val CANCEL: String = "Cancel"
     const val OOB_QUESTION: String = "These match the computer?"
     const val OOB_YES: String = "Yes"
@@ -75,10 +82,14 @@ object PairingStrings {
  * @param onOobYes invoked from OobConfirming.
  * @param onOobNo invoked from OobConfirming.
  * @param onDone invoked from Bonded / Failed — pops the route back to home.
+ * @param code the pairing code the operator typed, echoed back for rendering.
+ * @param onCodeChanged invoked on every keystroke of the code field.
  */
 @Composable
 fun PairingScreen(
     state: PairingState,
+    code: String,
+    onCodeChanged: (String) -> Unit,
     onStartScan: () -> Unit,
     onCancel: () -> Unit,
     onOobYes: () -> Unit,
@@ -93,7 +104,11 @@ fun PairingScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         when (state) {
-            is PairingState.Idle -> IdleContent(onStartScan = onStartScan)
+            is PairingState.Idle -> IdleContent(
+                code = code,
+                onCodeChanged = onCodeChanged,
+                onStartScan = onStartScan,
+            )
             is PairingState.Scanning -> ScanningContent(onCancel = onCancel)
             is PairingState.LescNegotiating -> LescContent(
                 code = state.code,
@@ -111,7 +126,25 @@ fun PairingScreen(
 }
 
 @Composable
-private fun IdleContent(onStartScan: () -> Unit) {
+private fun IdleContent(
+    code: String,
+    onCodeChanged: (String) -> Unit,
+    onStartScan: () -> Unit,
+) {
+    // The first bond needs a secret that never crossed the air: the operator
+    // reads a code off the computer and types it here (AUDIT-001 D-08).
+    OutlinedTextField(
+        value = code,
+        onValueChange = onCodeChanged,
+        singleLine = true,
+        label = { Text(PairingStrings.CODE_LABEL) },
+        placeholder = { Text(PairingStrings.CODE_HINT) },
+        supportingText = { Text(PairingStrings.CODE_HELP) },
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 16.dp)
+            .semantics { testTag = PairingTestTags.CODE_FIELD },
+    )
     Button(
         onClick = onStartScan,
         modifier = Modifier

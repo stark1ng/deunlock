@@ -122,6 +122,23 @@ class PairingViewModel(
     private var pickedPeer: PeerHandle? = null
 
     /**
+     * The code the operator read off the computer, echoed to the screen.
+     *
+     * Held here rather than in the state machine: it is an input, not a phase,
+     * and it must survive the Idle -> Scanning transition.
+     */
+    private val _pairingCode: MutableStateFlow<String> = MutableStateFlow("")
+
+    /** Observable pairing-code field contents. */
+    val pairingCode: StateFlow<String> = _pairingCode.asStateFlow()
+
+    /** Record what the operator typed and hand it to the backend. */
+    fun onPairingCodeChanged(code: String) {
+        _pairingCode.value = code
+        backend.supplyPairingCode(code)
+    }
+
+    /**
      * Transition Idle → Scanning. Called when the user taps the
      * "Pair with computer" CTA.
      */

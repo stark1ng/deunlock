@@ -148,13 +148,35 @@ public interface PairCompanionScanner {
  */
 public interface PairGattExchange {
     /**
-     * Connect to `address` (already bonded), write `phonePubkey` to
-     * the desktop's `phone-pubkey` characteristic, read the
-     * `host-pubkey` characteristic, and return its bytes. Throws on
-     * any underlying failure; the backend maps the throw to a
-     * `LescResult.Failed`.
+     * Connect to `address` (already bonded), read the desktop's
+     * `host-pubkey` characteristic, ask `buildWrite` for the pairing frame and
+     * write it to the `phone-pubkey` characteristic. Returns the host pubkey.
+     *
+     * The host pubkey has to be read first because the phone's frame is tagged
+     * over it — the proof is bound to what this desktop actually handed over
+     * (AUDIT-001 D-08). Throws on any underlying failure; the backend maps the
+     * throw to a `LescResult.Failed`.
      */
-    public fun exchangePubkeys(address: String, phonePubkey: ByteArray): ByteArray
+    public fun exchangeCodePairing(
+        address: String,
+        buildWrite: (hostPubkey: ByteArray) -> ByteArray,
+    ): ByteArray
+}
+
+/**
+ * Builds the pairing write for a given host pubkey.
+ *
+ * Abstracted so a JVM test can drive the pairing flow without the native library:
+ * production forwards to `uniffi.deunlock_mobile.buildPairWrite`, which keeps one
+ * implementation of the tagged bytes (AUDIT-001 D-08).
+ */
+public fun interface PairWriteBuilder {
+    public fun build(
+        code: String,
+        hostPubkey: ByteArray,
+        phonePubkey: ByteArray,
+        bond: ByteArray,
+    ): ByteArray
 }
 
 /**
@@ -174,16 +196,6 @@ public fun interface PairClock {
  */
 public fun interface PairSessionUuidLookup {
     public fun lookup(bondKey: ByteArray, minute: Long): ByteArray
-}
-
-/**
- * Helper that derives the shared `bond_key` from the two exchanged
- * Ed25519 pubkeys. Mirrors `deunlock_core::bond_key_from_pubkeys`
- * byte-for-byte. Production wires the UniFFI forwarder; tests
- * inject a deterministic stub.
- */
-public fun interface PairBondKeyDeriver {
-    public fun derive(hostPubkey: ByteArray, phonePubkey: ByteArray): ByteArray
 }
 
 /**
@@ -301,7 +313,7 @@ public class RealPairBackend(
     private val bondStateReceiverRegistrar: ReceiverRegistrar,
     private val clock: PairClock,
     private val sessionUuidLookup: PairSessionUuidLookup,
-    private val bondKeyDeriver: PairBondKeyDeriver,
+    private val pairWriteBuilder: PairWriteBuilder = UniffiPairWriteBuilder(),
     private val keystoreKeyGenerator: KeystoreKeyGenerator? = null,
     private val onLescResultCallback: AtomicReference<(LescResult) -> Unit> = AtomicReference { _ -> },
     private val onPeerPickedCallback: AtomicReference<(PeerHandle) -> Unit> = AtomicReference { _ -> },
@@ -472,7 +484,7 @@ public class RealPairBackend(
         // Existing OS-level bond, but app-level Phase 4 (GATT pubkey
         // exchange + bond.json write) may never have completed — happens
         // after a prior run reached BOND_BONDED at the OS but deadlocked
-        // before exchangePubkeys. Skip createBond and drive Phase 4
+        // before the post-bond exchange. Skip createBond and drive Phase 4
         // directly off the existing bond.
         if (bondState == BluetoothDevice.BOND_BONDED) {
             Log.i(REAL_PAIR_BACKEND_LOG_TAG, "already bonded; skipping createBond, driving Phase 4")
@@ -547,7 +559,7 @@ public class RealPairBackend(
      *
      * Runs the GATT exchange off the main thread because the
      * receiver's `onReceive` callback fires on the main looper.
-     * `AndroidPairGattExchange.exchangePubkeys` blocks on
+     * `AndroidPairGattExchange.exchangeCodePairing` blocks on
      * `CountDownLatch.await` waiting for `BluetoothGattCallback`
      * dispatches, and those callbacks also default to the main
      * thread — running the exchange inline deadlocks the
@@ -555,7 +567,7 @@ public class RealPairBackend(
      * 6-second `l2c_link_timeout: All channels closed` we saw
      * post-`BOND_BONDED` in the 2026-05-17 run was exactly this:
      * the link came up encrypted, but the main thread was wedged
-     * inside `exchangePubkeys` so no GATT traffic ever flowed, and
+     * inside `exchangeCodePairing` so no GATT traffic ever flowed, and
      * BlueZ's idle timeout dropped the link before service discovery
      * resolved.
      */
@@ -575,6 +587,14 @@ public class RealPairBackend(
      * so the Robolectric runtime test can drive the failure-surface
      * matrix synchronously without spinning up a real GATT stack.
      */
+    /** The code the operator typed in, handed over by the ViewModel. */
+    @Volatile
+    private var pairingCodeValue: String = ""
+
+    override fun supplyPairingCode(code: String) {
+        pairingCodeValue = code.trim()
+    }
+
     internal fun runPostBondExchange(address: String) {
         if (cleanedUp || !exchangeStarted.compareAndSet(false, true)) return
         val exchange = gattExchange
@@ -600,7 +620,24 @@ public class RealPairBackend(
             return
         }
         val phonePubkey = material.pubkey
-        val hostPubkey = runCatching { exchange.exchangePubkeys(address, phonePubkey) }.getOrElse {
+        // The bond is random and proposed by this phone; the pairing code only
+        // authenticates the handover (AUDIT-001 D-08). Fifty bits of code must
+        // never become the long-lived key.
+        val freshBond = ByteArray(PAIR_BOND_KEY_LEN).also { java.security.SecureRandom().nextBytes(it) }
+        val pairingCode = pairingCodeValue
+        if (pairingCode.length != PAIRING_CODE_LEN) {
+            // Say it plainly: the operator skipped the code, and no amount of
+            // GATT traffic will make the desktop accept this phone (D-08).
+            val reason = "pairing code missing: run deunlock pair-code on the computer and type it here"
+            Log.w(REAL_PAIR_BACKEND_LOG_TAG, reason)
+            lescResultDeferred.complete(LescResult.Failed(reason))
+            return
+        }
+        val hostPubkey = runCatching {
+            exchange.exchangeCodePairing(address) { hostPubkey ->
+                pairWriteBuilder.build(pairingCode, hostPubkey, phonePubkey, freshBond)
+            }
+        }.getOrElse {
             val reason = "pair-service exchange failed: ${it.message ?: it::class.java.simpleName}"
             Log.w(REAL_PAIR_BACKEND_LOG_TAG, reason, it)
             lescResultDeferred.complete(LescResult.Failed(reason))
@@ -610,7 +647,7 @@ public class RealPairBackend(
             lescResultDeferred.complete(LescResult.Failed("host pubkey wrong length: ${hostPubkey.size}"))
             return
         }
-        val bondKey = bondKeyDeriver.derive(hostPubkey, phonePubkey)
+        val bondKey = freshBond
         if (bondKey.size != PAIR_BOND_KEY_LEN) {
             lescResultDeferred.complete(LescResult.Failed("bond_key wrong length: ${bondKey.size}"))
             return
@@ -629,7 +666,24 @@ public class RealPairBackend(
     private companion object {
         /** Number of digits in the LESC numeric-comparison code. */
         const val LESC_CODE_DIGITS: Int = 6
+
+        /** Characters in a code printed by `deunlock pair-code`. */
+        const val PAIRING_CODE_LEN: Int = 10
     }
+}
+
+/**
+ * Production [PairWriteBuilder]: the tagged frame is built by the same Rust code
+ * the tests exercise, so the phone and the desktop cannot disagree about what was
+ * signed (AUDIT-001 D-08).
+ */
+public class UniffiPairWriteBuilder : PairWriteBuilder {
+    override fun build(
+        code: String,
+        hostPubkey: ByteArray,
+        phonePubkey: ByteArray,
+        bond: ByteArray,
+    ): ByteArray = uniffi.deunlock_mobile.buildPairWrite(code, hostPubkey, phonePubkey, bond)
 }
 
 /**

@@ -33,6 +33,8 @@ class PairingScreenTest {
         composeTestRule.setContent {
             PairingScreen(
                 state = state,
+                code = "",
+                onCodeChanged = {},
                 onStartScan = {},
                 onCancel = {},
                 onOobYes = {},
