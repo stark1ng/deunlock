@@ -655,3 +655,17 @@ The rotation tick also logs the pair-mode transition now
 (`advertising in pair mode: no bonds, pair service discoverable`). It is the
 question an operator asks immediately after a revoke — "can the phone find this
 computer again?" — and at zero peers the tick had nothing else to say.
+
+### D-16 (low, but it cost hours) — `advertising` was a constant
+
+`deunlock status` printed `advertising: false`, always: `ADVERTISING_STATE_V01`, a
+v0.1 placeholder, hard-coded and never wired. On a machine whose daemon was
+advertising perfectly well, the operator's most authoritative-looking line said
+it was not — which is exactly the kind of confident lie that sends someone
+chasing the wrong defect (in this session, "the computer is not in the list").
+
+The daemon has reported `transport_ready` for a while; the CLI simply never
+asked. It does now, and `advertising` is `Option<bool>`: `true`, `false`, or
+`unknown` when the daemon is down or predates the field. A diagnostic surface
+must be allowed to say "I do not know" — that is a different, and much more
+useful, answer than a constant.

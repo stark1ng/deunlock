@@ -98,6 +98,16 @@ pub const LAST_UNLOCK_LOG_MAX_LINES: usize = 64;
 /// stable across the S-018 transition.
 pub const ADVERTISING_STATE_V01: bool = false;
 
+/// Render the advertising state, admitting when it is not known.
+#[must_use]
+pub fn format_advertising(state: Option<bool>) -> &'static str {
+    match state {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    }
+}
+
 /// Token printed when `last.log` is missing or empty.
 pub const LAST_UNLOCK_NO_ENTRIES: &str = "(no entries)";
 
@@ -383,9 +393,14 @@ pub struct StatusSnapshot {
     pub adapter: String,
     /// Adapter state (Powered/Down/Missing).
     pub adapter_state: AdapterState,
-    /// Whether the host is currently advertising. Hard-coded to
-    /// [`ADVERTISING_STATE_V01`] in v0.1.
-    pub advertising: bool,
+    /// Whether the host is currently advertising.
+    ///
+    /// `None` when nothing could be asked: the daemon is down, or it predates
+    /// transport-health reporting. This used to be the constant
+    /// [`ADVERTISING_STATE_V01`] — always `false`, even while the daemon was
+    /// advertising happily — which is worse than "unknown": it sends an operator
+    /// hunting for a bug that does not exist.
+    pub advertising: Option<bool>,
     /// Count of bonds in the bond store.
     pub bonds_count: usize,
     /// Last unlock outcome, ready for printing.
@@ -397,7 +412,7 @@ pub struct StatusSnapshot {
 pub fn render_status_to(writer: &mut dyn Write, snapshot: &StatusSnapshot) -> Result<(), StatusError> {
     writeln!(writer, "adapter:           {}", snapshot.adapter)?;
     writeln!(writer, "adapter-state:     {}", snapshot.adapter_state.as_token())?;
-    writeln!(writer, "advertising:       {}", snapshot.advertising)?;
+    writeln!(writer, "advertising:       {}", format_advertising(snapshot.advertising))?;
     writeln!(writer, "bonds-count:       {}", snapshot.bonds_count)?;
     write!(writer, "last-unlock:       ")?;
     match &snapshot.last_unlock {
@@ -426,14 +441,18 @@ pub fn effective_last_log_path(opts: &StatusOpts) -> PathBuf {
 /// Returns [`StatusError::Io`] for unexpected I/O failure on
 /// `last.log` (a `NotFound` is *not* an error — it folds into
 /// `NoEntries`).
-pub fn gather_status(opts: &StatusOpts, probe: &dyn AdapterProbe) -> Result<StatusSnapshot, StatusError> {
+pub fn gather_status(
+    opts: &StatusOpts,
+    probe: &dyn AdapterProbe,
+    advertising: Option<bool>,
+) -> Result<StatusSnapshot, StatusError> {
     let path = bonds_path(&opts.bond_dir);
     let store = BondStore::load(&path)?;
     let last_unlock = read_last_unlock(&effective_last_log_path(opts))?;
     Ok(StatusSnapshot {
         adapter: opts.adapter.clone(),
         adapter_state: probe.probe(&opts.adapter),
-        advertising: ADVERTISING_STATE_V01,
+        advertising,
         bonds_count: store.list().len(),
         last_unlock,
     })
@@ -446,7 +465,11 @@ pub fn gather_status(opts: &StatusOpts, probe: &dyn AdapterProbe) -> Result<Stat
 /// # Errors
 ///
 /// See [`gather_status`].
-pub async fn gather_status_async(opts: &StatusOpts, probe: &dyn AsyncAdapterProbe) -> Result<StatusSnapshot, StatusError> {
+pub async fn gather_status_async(
+    opts: &StatusOpts,
+    probe: &dyn AsyncAdapterProbe,
+    advertising: Option<bool>,
+) -> Result<StatusSnapshot, StatusError> {
     let path = bonds_path(&opts.bond_dir);
     let store = BondStore::load(&path)?;
     let last_unlock = read_last_unlock(&effective_last_log_path(opts))?;
@@ -454,7 +477,7 @@ pub async fn gather_status_async(opts: &StatusOpts, probe: &dyn AsyncAdapterProb
     Ok(StatusSnapshot {
         adapter: opts.adapter.clone(),
         adapter_state,
-        advertising: ADVERTISING_STATE_V01,
+        advertising,
         bonds_count: store.list().len(),
         last_unlock,
     })
@@ -489,7 +512,13 @@ async fn render_one_shot(opts: &StatusOpts, probe: &dyn AsyncAdapterProbe) -> Re
         return Ok(());
     }
     write_daemon_section(&mut writer, &cli_report)?;
-    let snapshot = gather_status_async(opts, probe).await?;
+    // The daemon is the only authority on whether it is advertising; asking it
+    // and saying "unknown" when it cannot answer beats printing a constant.
+    let advertising = match &cli_report.daemon {
+        DaemonProbeState::Up { transport_ready, .. } => *transport_ready,
+        DaemonProbeState::Down { .. } => None,
+    };
+    let snapshot = gather_status_async(opts, probe, advertising).await?;
     render_status_to(&mut writer, &snapshot)
 }
 
@@ -816,7 +845,7 @@ mod tests {
         let snap = StatusSnapshot {
             adapter: "hci0".to_owned(),
             adapter_state: AdapterState::Missing,
-            advertising: false,
+            advertising: Some(false),
             bonds_count: 0,
             last_unlock: LastUnlockView::NoEntries,
         };
@@ -836,7 +865,7 @@ mod tests {
         let snap = StatusSnapshot {
             adapter: "hci0".to_owned(),
             adapter_state: AdapterState::Powered,
-            advertising: false,
+            advertising: Some(false),
             bonds_count: 2,
             last_unlock: LastUnlockView::Entry(LastUnlockEntry {
                 timestamp: SAMPLE_TS.to_owned(),
@@ -868,10 +897,10 @@ mod tests {
             json: false,
         };
         let probe = FixedProbe(AdapterState::Down);
-        let snap = gather_status(&opts, &probe).expect("gather");
+        let snap = gather_status(&opts, &probe, Some(false)).expect("gather");
         assert_eq!(snap.adapter, "test-adapter");
         assert_eq!(snap.adapter_state, AdapterState::Down);
-        assert_eq!(snap.advertising, ADVERTISING_STATE_V01);
+        assert_eq!(snap.advertising, Some(false));
         assert_eq!(snap.bonds_count, 0);
         assert_eq!(snap.last_unlock, LastUnlockView::NoEntries);
     }
