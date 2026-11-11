@@ -20,6 +20,7 @@ pub mod list;
 pub mod oob;
 pub mod pair;
 pub mod pair_backend;
+pub mod pair_code;
 pub mod pair_probe;
 pub mod pair_qr;
 pub mod revoke;

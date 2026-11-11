@@ -279,6 +279,8 @@ fn pending_for(secret: &[u8; 32], expires_at: u64) -> deunlock_core::PendingOffe
         secret: secret.iter().map(|b| format!("{b:02x}")).collect(),
         host_id: HOST_ID.iter().map(|b| format!("{b:02x}")).collect(),
         expires_at,
+        code: None,
+        attempts: 0,
     }
 }
 

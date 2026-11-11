@@ -29,6 +29,7 @@ pub mod kex;
 pub mod mac;
 pub mod replay;
 pub mod qr_pair;
+pub mod pair_code;
 pub mod revoke;
 pub mod qr_pairing;
 pub mod secrets;
@@ -79,4 +80,8 @@ pub use sign::{
     verify_transcript,
 };
 
+pub use pair_code::{
+    normalise_code, pair_code_tag, render_code, tags_equal, PairCodeError, PairWrite,
+    PAIR_BOND_BYTES, PAIR_CODE_FRAME_LEN, PAIR_CODE_LEN, PAIR_CODE_MAGIC,
+};
 pub use revoke::{decode_revoke, encode_revoke, is_revoke_frame, RevokeError, REVOKE_FRAME_LEN};

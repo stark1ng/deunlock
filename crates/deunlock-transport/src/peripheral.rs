@@ -58,6 +58,22 @@ use tokio::{
     task::JoinHandle,
 };
 
+use deunlock_core::PairWrite;
+
+/// One pairing attempt as it arrived on the pair characteristic.
+///
+/// `host_pubkey` rides along because it is the value the pair service handed the
+/// phone (a random per-start key, not the desktop identity), and the phone's proof
+/// is tagged over exactly what it was given — verifying against anything else
+/// would refuse every honest phone.
+#[derive(Debug, Clone)]
+pub struct PairEvent {
+    /// The host pubkey the pair characteristic exposed to this phone.
+    pub host_pubkey: [u8; PAIR_PUBKEY_LEN],
+    /// The phone's write.
+    pub write: PairWrite,
+}
+
 use crate::{
     bluez::{
         BOND_KEY_BYTES, PAIR_PUBKEY_LEN, DEUNLOCK_CHALLENGE_CHAR_UUID, DEUNLOCK_PAIR_HOST_PUBKEY_CHAR_UUID, DEUNLOCK_PAIR_PHONE_PUBKEY_CHAR_UUID,
@@ -341,7 +357,7 @@ pub struct PersistentPeripheral {
     /// being served at the time of the write. The receiver is owned
     /// by the daemon (returned from `new()`) and drives bond
     /// derivation + persistence + `add_peer`.
-    pair_event_tx: mpsc::Sender<([u8; PAIR_PUBKEY_LEN], [u8; PAIR_PUBKEY_LEN])>,
+    pair_event_tx: mpsc::Sender<PairEvent>,
     /// JoinHandle for the pair watcher task spawned by the most
     /// recent application registration. Aborted before re-spawning
     /// so we never have two watchers competing on stale control
@@ -353,7 +369,7 @@ pub struct PersistentPeripheral {
 
 impl PersistentPeripheral {
     /// Open the available BlueZ default adapter, including renumbered controllers.
-    pub async fn new_default() -> Result<(Arc<Self>, mpsc::Receiver<([u8; PAIR_PUBKEY_LEN], [u8; PAIR_PUBKEY_LEN])>), PeripheralError> {
+    pub async fn new_default() -> Result<(Arc<Self>, mpsc::Receiver<PairEvent>), PeripheralError> {
         let session = bluer::Session::new().await.map_err(|err| PeripheralError::Backend {
             reason: format!("default adapter session: {err}"),
         })?;
@@ -376,7 +392,7 @@ impl PersistentPeripheral {
     /// for any other upstream failure.
     pub async fn new(
         adapter_id: &str,
-    ) -> Result<(Arc<Self>, mpsc::Receiver<([u8; PAIR_PUBKEY_LEN], [u8; PAIR_PUBKEY_LEN])>), PeripheralError> {
+    ) -> Result<(Arc<Self>, mpsc::Receiver<PairEvent>), PeripheralError> {
         let session = bluer::Session::new()
             .await
             .map_err(|err| PeripheralError::from(map_adapter_open_error(adapter_id, err)))?;
@@ -442,7 +458,7 @@ impl PersistentPeripheral {
         // (host_pubkey, phone_pubkey) pairs to. Depth 8 absorbs
         // concurrent retries without back-pressuring the BlueZ
         // GATT-write thread.
-        let (pair_event_tx, pair_event_rx) = mpsc::channel::<([u8; PAIR_PUBKEY_LEN], [u8; PAIR_PUBKEY_LEN])>(8);
+        let (pair_event_tx, pair_event_rx) = mpsc::channel::<PairEvent>(8);
         let events = session.events().await.map_err(|err| PeripheralError::Backend {
             reason: format!("adapter lifecycle subscription: {err}"),
         })?;
@@ -653,17 +669,35 @@ impl PersistentPeripheral {
                         continue;
                     }
                 };
-                let mut buf = [0u8; PAIR_PUBKEY_LEN];
-                match reader.read_exact(&mut buf).await {
-                    Ok(_) => {
-                        tracing::info!(target: "deunlock_transport", "pair watcher: phone pubkey received");
-                        if let Err(err) = pair_event_tx.send((host_pubkey_for_watcher, buf)).await {
-                            tracing::warn!(target: "deunlock_transport", error = %err, "pair watcher: forward to event channel failed; daemon receiver gone");
-                            break;
+                // A pairing write is variable-length now: the phone proves it
+                // was given the operator's code (AUDIT-001 D-08). Read what the
+                // phone sent, bounded well above the real frame, then let the
+                // decoder decide what shape it is.
+                let mut buf = Vec::with_capacity(deunlock_core::PAIR_CODE_FRAME_LEN);
+                match reader.read_to_end(&mut buf).await {
+                    Ok(_) => match PairWrite::decode(&buf) {
+                        Ok(write) => {
+                            tracing::info!(
+                                target: "deunlock_transport",
+                                bytes = buf.len(),
+                                "pair watcher: pairing write received"
+                            );
+                            if let Err(err) = pair_event_tx.send(PairEvent { host_pubkey: host_pubkey_for_watcher, write }).await {
+                                tracing::warn!(target: "deunlock_transport", error = %err, "pair watcher: forward to event channel failed; daemon receiver gone");
+                                break;
+                            }
                         }
-                    }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "deunlock_transport",
+                                bytes = buf.len(),
+                                error = %err,
+                                "pair watcher: refused a pairing write"
+                            );
+                        }
+                    },
                     Err(err) => {
-                        tracing::warn!(target: "deunlock_transport", error = %err, "pair watcher: read_exact failed");
+                        tracing::warn!(target: "deunlock_transport", error = %err, "pair watcher: read failed");
                     }
                 }
             }

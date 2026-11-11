@@ -55,7 +55,7 @@ pub use mock::{
 };
 #[cfg(any(test, feature = "test-fake"))]
 pub use peripheral::FakePeripheral;
-pub use peripheral::{BondKey, Peripheral, PeripheralError, PersistentPeripheral};
+pub use peripheral::{BondKey, PairEvent, Peripheral, PeripheralError, PersistentPeripheral};
 use deunlock_core::Frame;
 
 /// A Bluetooth peer the PAM module can talk to.

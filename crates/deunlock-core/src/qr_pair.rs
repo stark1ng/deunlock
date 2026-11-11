@@ -254,6 +254,18 @@ pub struct PendingOffer {
     pub host_id: String,
     /// Unix seconds after which the offer is dead.
     pub expires_at: u64,
+    /// The ten-character code the operator reads off the desktop, when this
+    /// offer was minted by `deunlock pair-code` for the BLE path.
+    ///
+    /// `None` for a QR offer: the phone scans the whole secret, so there is no
+    /// typed projection of it. `#[serde(default)]` keeps offers written by an
+    /// older build readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Failed code attempts against this offer, so a short code cannot be
+    /// ground down by a script that reconnects.
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 impl PendingOffer {
@@ -264,6 +276,8 @@ impl PendingOffer {
             secret: hex_encode(&offer.secret),
             host_id: hex_encode(&offer.host_id),
             expires_at: offer.expires_at,
+            code: None,
+            attempts: 0,
         }
     }
 

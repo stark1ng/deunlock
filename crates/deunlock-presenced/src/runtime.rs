@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use deunlock_core::{Bond, BondStatus, BondStore, bond_key_from_pubkeys, peer_id_from_pubkey};
+use deunlock_core::{Bond, BondStatus, BondStore, peer_id_from_pubkey};
 use deunlock_transport::{BOND_KEY_BYTES, FakePeripheral, Peripheral, PersistentPeripheral};
 
 use crate::composite::CompositePeripheral;
@@ -532,7 +532,7 @@ async fn maybe_spawn_orchestrator(
     // discoverable so a phone can complete its first pair, after
     // which the consumer adds the bond and the orchestrator can
     // spin up on the next reload.
-    type PairEventRx = tokio::sync::mpsc::Receiver<([u8; 32], [u8; 32])>;
+    type PairEventRx = tokio::sync::mpsc::Receiver<deunlock_transport::PairEvent>;
     let (peripheral, pair_events): (Arc<dyn Peripheral + Send + Sync>, Option<PairEventRx>) = match config.peripheral_mode {
         PeripheralMode::Real => match PersistentPeripheral::new_default().await {
             Ok((p, rx)) => (p, Some(rx)),
@@ -608,7 +608,23 @@ async fn maybe_spawn_orchestrator(
         let bonds_path = config.bonds_file.clone();
         let keys_dir = config.keys_dir.clone();
         let reload_tx_for_pair = reload_tx.clone();
-        tokio::spawn(pair_event_consumer(rx, bonds_path, keys_dir, reload_tx_for_pair));
+        // Same hand-off file the QR path uses: `deunlock pair-code` writes it,
+        // the daemon verifies codes against it and deletes it on success.
+        let offer_path_for_pair = std::env::var_os("DEUNLOCK_PAIRING_OFFER").map_or_else(
+            || std::path::PathBuf::from(deunlock_core::DEFAULT_PAIRING_OFFER_PATH),
+            std::path::PathBuf::from,
+        );
+        // The pair write is tagged under (host_pubkey, phone_pubkey, bond), so
+        // the consumer needs this machine's public key. Loaded here rather than
+        // threaded through everything, and a missing identity simply refuses
+        // every pairing with a reason instead of bonding blind.
+        tokio::spawn(pair_event_consumer(
+            rx,
+            bonds_path,
+            keys_dir,
+            reload_tx_for_pair,
+            offer_path_for_pair,
+        ));
     }
     let orchestrator_handle = Arc::clone(&orchestrator);
     let handle = tokio::spawn(Arc::clone(&orchestrator).run(shutdown));
@@ -718,6 +734,54 @@ fn warn_no_orchestrator(reason: &str) {
     tracing::warn!(reason, "orchestrator not started; daemon will serve socket only");
 }
 
+/// Check a phone's pair write against the armed offer.
+///
+/// Every refusal is a distinct reason, because "pairing did not work" is the
+/// least useful sentence in this protocol: an expired offer, no offer at all and
+/// a wrong code look identical from the phone.
+///
+/// On success the offer file is deleted — one code buys exactly one bond — and on
+/// failure its attempt counter is incremented, so a ten-character code cannot be
+/// ground down by a script that reconnects. Five wrong codes kill the offer
+/// outright.
+fn verify_pair_code(
+    offer_path: &std::path::Path,
+    host_pubkey: &[u8; 32],
+    phone_pubkey: &[u8; 32],
+    write: &deunlock_core::PairWrite,
+) -> Result<(), String> {
+    const MAX_ATTEMPTS: u32 = 5;
+    let now = u64::try_from(::time::OffsetDateTime::now_utc().unix_timestamp())
+        .unwrap_or(0);
+    let offer = deunlock_core::PendingOffer::read(offer_path, now)
+        .map_err(|err| format!("no usable offer ({err})"))?;
+    if offer.attempts >= MAX_ATTEMPTS {
+        let _ = std::fs::remove_file(offer_path);
+        return Err(format!(
+            "offer spent after {} wrong codes",
+            offer.attempts
+        ));
+    }
+    let code = offer
+        .code
+        .clone()
+        .ok_or_else(|| "offer carries no code (this is a QR offer)".to_owned())?;
+    let expected = deunlock_core::pair_code_tag(&code, host_pubkey, phone_pubkey, &write.bond)
+        .map_err(|err| format!("cannot derive the expected tag: {err}"))?;
+    if !deunlock_core::tags_equal(&expected, &write.tag) {
+        let mut spent = offer.clone();
+        spent.attempts = spent.attempts.saturating_add(1);
+        let _ = spent.write(offer_path);
+        return Err(format!(
+            "wrong pairing code (attempt {}/{MAX_ATTEMPTS})",
+            spent.attempts
+        ));
+    }
+    std::fs::remove_file(offer_path)
+        .map_err(|err| format!("bond accepted but the offer could not be consumed: {err}"))?;
+    Ok(())
+}
+
 /// Consume pair events from the peripheral's pair watcher. Each event
 /// is a `(host_pubkey, phone_pubkey)` pair the phone wrote to the
 /// pair-mode characteristic after completing LESC bonding. The
@@ -732,18 +796,37 @@ fn warn_no_orchestrator(reason: &str) {
 /// will rerun pair if the link dropped. We never panic the daemon on
 /// a malformed pair attempt.
 async fn pair_event_consumer(
-    mut rx: tokio::sync::mpsc::Receiver<([u8; 32], [u8; 32])>,
+    mut rx: tokio::sync::mpsc::Receiver<deunlock_transport::PairEvent>,
     bonds_path: std::path::PathBuf,
     keys_dir: std::path::PathBuf,
     reload_tx: mpsc::Sender<ReloadCommand>,
+    offer_path: std::path::PathBuf,
 ) {
-    while let Some((host_pubkey, phone_pubkey)) = rx.recv().await {
+    while let Some(event) = rx.recv().await {
+        let host_pubkey = event.host_pubkey;
+        let write = event.write;
+        let phone_pubkey = write.phone_pubkey;
+        let bond_key = write.bond;
         let peer_id = peer_id_from_pubkey(&phone_pubkey);
-        let bond_key = bond_key_from_pubkeys(&host_pubkey, &phone_pubkey);
+        // The bond is no longer derived from two public keys. The phone must
+        // prove it was given the operator's code, against an offer that is
+        // armed right now, unexpired and not out of attempts (AUDIT-001 D-08).
+        match verify_pair_code(&offer_path, &host_pubkey, &phone_pubkey, &write) {
+            Ok(()) => {}
+            Err(reason) => {
+                tracing::warn!(
+                    target: "deunlock_presenced",
+                    peer_id = %peer_id,
+                    reason = %reason,
+                    "pair: refused, the phone did not prove the pairing code"
+                );
+                continue;
+            }
+        }
         tracing::info!(
             target: "deunlock_presenced",
             peer_id = %peer_id,
-            "pair: deriving bond and persisting"
+            "pair: code proved, persisting the phone's bond key"
         );
         // 1. Write the per-peer key file at <keys_dir>/<peer_id>.bin.
         //    Permissions match the established convention used by
@@ -846,5 +929,135 @@ mod recovery_tests {
     #[tokio::test(start_paused = true)]
     async fn absent_transport_requests_supervised_restart() {
         assert!(matches!(wait_for_transport_failure(None).await, RunError::Transport(_)));
+    }
+
+    // ---------------------------------------------------------------- D-08
+    // The pairing code is the only thing standing between "a nearby phone" and
+    // "a bonded phone". Each refusal below is a distinct way that can fail, and
+    // each is a test because a silent accept is indistinguishable from success.
+
+    fn armed_offer(dir: &std::path::Path, code: &str) -> std::path::PathBuf {
+        let path = dir.join("pairing.offer");
+        let offer = deunlock_core::PendingOffer {
+            secret: "11".repeat(deunlock_core::PAIRING_SECRET_BYTES),
+            host_id: "22".repeat(32),
+            expires_at: u64::MAX / 2,
+            code: Some(code.to_owned()),
+            attempts: 0,
+        };
+        offer.write(&path).expect("offer written");
+        path
+    }
+
+    fn write_for(code: &str, host: &[u8; 32], phone: &[u8; 32]) -> deunlock_core::PairWrite {
+        let bond = [0x42u8; deunlock_core::PAIR_BOND_BYTES];
+        let tag = deunlock_core::pair_code_tag(code, host, phone, &bond).expect("tag");
+        deunlock_core::PairWrite {
+            phone_pubkey: *phone,
+            tag,
+            bond,
+        }
+    }
+
+    #[test]
+    fn a_proved_code_is_accepted_and_the_offer_is_spent() {
+        let dir = std::env::temp_dir().join(format!("deunlock-verify-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let code = deunlock_core::render_code(&[3u8; 32]);
+        let path = armed_offer(&dir, &code);
+        let host = [0x01u8; 32];
+        let phone = [0x02u8; 32];
+        assert!(verify_pair_code(&path, &host, &phone, &write_for(&code, &host, &phone)).is_ok());
+        assert!(!path.exists(), "one code must buy exactly one bond");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wrong_code_is_refused_and_costs_an_attempt() {
+        let dir = std::env::temp_dir().join(format!("deunlock-verify-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let code = deunlock_core::render_code(&[4u8; 32]);
+        let wrong = deunlock_core::render_code(&[5u8; 32]);
+        let path = armed_offer(&dir, &code);
+        let host = [0x01u8; 32];
+        let phone = [0x02u8; 32];
+        let err = verify_pair_code(&path, &host, &phone, &write_for(&wrong, &host, &phone))
+            .expect_err("wrong code must be refused");
+        assert!(err.contains("wrong pairing code"), "{err}");
+        assert!(path.exists(), "a wrong code must not burn the offer");
+        let stored = deunlock_core::PendingOffer::read(&path, 0).expect("re-read");
+        assert_eq!(stored.attempts, 1, "the attempt must be counted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_armed_offer_refuses_everything() {
+        let dir = std::env::temp_dir().join(format!("deunlock-verify-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let code = deunlock_core::render_code(&[6u8; 32]);
+        let host = [0x01u8; 32];
+        let phone = [0x02u8; 32];
+        let err = verify_pair_code(&dir.join("pairing.offer"), &host, &phone, &write_for(&code, &host, &phone))
+            .expect_err("nothing armed means nothing pairs");
+        assert!(err.contains("no usable offer"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_qr_only_offer_cannot_be_answered_with_a_code() {
+        let dir = std::env::temp_dir().join(format!("deunlock-verify-qr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = dir.join("pairing.offer");
+        deunlock_core::PendingOffer {
+            secret: "11".repeat(deunlock_core::PAIRING_SECRET_BYTES),
+            host_id: "22".repeat(32),
+            expires_at: u64::MAX / 2,
+            code: None,
+            attempts: 0,
+        }
+        .write(&path)
+        .expect("offer");
+        let code = deunlock_core::render_code(&[7u8; 32]);
+        let host = [0x01u8; 32];
+        let phone = [0x02u8; 32];
+        let err = verify_pair_code(&path, &host, &phone, &write_for(&code, &host, &phone))
+            .expect_err("a QR offer has no code to prove");
+        assert!(err.contains("no code"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn five_wrong_codes_kill_the_offer() {
+        let dir = std::env::temp_dir().join(format!("deunlock-verify-spent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let code = deunlock_core::render_code(&[8u8; 32]);
+        let path = armed_offer(&dir, &code);
+        let host = [0x01u8; 32];
+        let phone = [0x02u8; 32];
+        let wrong = deunlock_core::render_code(&[9u8; 32]);
+        for _ in 0..5 {
+            let _ = verify_pair_code(&path, &host, &phone, &write_for(&wrong, &host, &phone));
+        }
+        // The right code is too late: the budget is gone.
+        let err = verify_pair_code(&path, &host, &phone, &write_for(&code, &host, &phone))
+            .expect_err("a spent offer must not accept the right code later");
+        assert!(err.contains("no usable offer") || err.contains("spent"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bond_swapped_after_signing_is_refused() {
+        let dir = std::env::temp_dir().join(format!("deunlock-verify-swap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let code = deunlock_core::render_code(&[0xau8; 32]);
+        let path = armed_offer(&dir, &code);
+        let host = [0x01u8; 32];
+        let phone = [0x02u8; 32];
+        let mut write = write_for(&code, &host, &phone);
+        write.bond = [0xffu8; deunlock_core::PAIR_BOND_BYTES];
+        let err = verify_pair_code(&path, &host, &phone, &write)
+            .expect_err("the tag covers the bond, so a swap must fail");
+        assert!(err.contains("wrong pairing code"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
