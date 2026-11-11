@@ -97,6 +97,15 @@ fn peer_service_uuid(bond_key: &BondKey) -> Uuid {
 // Public type aliases — keep the trait surface readable.
 // ---------------------------------------------------------------------------
 
+/// How many times a rotation retries `Advertise` before reporting failure.
+/// BlueZ unregisters the previous advertisement asynchronously, so the first
+/// attempt right after a teardown routinely loses the race.
+const ADVERTISE_RETRIES: usize = 5;
+
+/// Delay between advertisement retries: long enough for bluetoothd to drop
+/// the previous registration, short enough to stay inside one rotation tick.
+const ADVERTISE_RETRY_DELAY: Duration = Duration::from_millis(60);
+
 /// 32-byte bond key the daemon holds for one bonded peer. Mirrors the
 /// width of `deunlock_core::BOND_KEY_DERIVED_BYTES` /
 /// [`BOND_KEY_BYTES`]. Re-exported here so callers do not have to dig
@@ -399,7 +408,22 @@ impl PersistentPeripheral {
         // never prompts; that's the UX contract.
         let agent = Agent {
             request_default: true,
-            request_confirmation: Some(Box::new(|_req: RequestConfirmation| Box::pin(async move { Ok(()) }))),
+            request_confirmation: Some(Box::new(|req: RequestConfirmation| {
+                Box::pin(async move {
+                    // The phone shows these six digits and asks the operator to
+                    // compare them with the desktop. Auto-accepting without
+                    // surfacing them turned that question into a formality, so
+                    // the passkey goes to the log at `warn`: it is the only
+                    // channel a headless daemon has. The trust signal stays the
+                    // CDM picker tap — this line exists so a human *can* check.
+                    tracing::warn!(
+                        passkey = req.passkey,
+                        peer = %req.device,
+                        "LESC numeric comparison: phone shows these 6 digits — confirm only if they match"
+                    );
+                    Ok(())
+                })
+            })),
             ..Default::default()
         };
         let agent_handle = session.register_agent(agent).await.map_err(|err| PeripheralError::Backend {
@@ -902,16 +926,29 @@ impl Peripheral for PersistentPeripheral {
         // Tear down the previous advertisement first so a passive
         // observer never sees both UUID sets simultaneously.
         slot.take();
-        let advertisement = Self::build_advertisement(uuids);
-        let handle = self
-            .adapter
-            .advertise(advertisement)
-            .await
-            .map_err(|err| PeripheralError::Backend {
-                reason: format!("advertise: {err}"),
-            })?;
-        *slot = Some(handle);
-        Ok(())
+        // BlueZ frees the advertisement slot asynchronously: registering the
+        // replacement in the same tick after the old handle was dropped comes
+        // back as `Failed to register advertisement`. The old code treated
+        // that as fatal and took the daemon down right after a successful
+        // pairing (measured: rotate a second after `reload trigger=pair`).
+        // Give the slot a moment and retry — a rotation is idempotent.
+        let mut last = String::new();
+        for attempt in 0..ADVERTISE_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(ADVERTISE_RETRY_DELAY).await;
+            }
+            let advertisement = Self::build_advertisement(uuids.clone());
+            match self.adapter.advertise(advertisement).await {
+                Ok(handle) => {
+                    *slot = Some(handle);
+                    return Ok(());
+                }
+                Err(err) => last = err.to_string(),
+            }
+        }
+        Err(PeripheralError::Backend {
+            reason: format!("advertise: {last}"),
+        })
     }
 
     async fn notify_challenge(&self, peer_id: &str, frame: &[u8]) -> Result<(), PeripheralError> {

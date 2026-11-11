@@ -26,7 +26,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
@@ -436,8 +436,18 @@ pub struct ReloadCommand {
 /// disk, diffs the result against the live peer set, and emits the
 /// minimal `add_peer` / `remove_peer` calls before re-publishing the
 /// fresh UUID union.
+/// How many rotation ticks may fail in a row before the daemon reports the
+/// transport as unready. A single failure is a race with bluetoothd, not a
+/// dead adapter; three in a row is a real outage.
+const ROTATION_FAILURES_BEFORE_UNREADY: u32 = 3;
+
 pub struct Orchestrator {
     transport_ready: AtomicBool,
+    /// Consecutive rotation failures. One lost race with bluetoothd must not
+    /// take the daemon down — a single bad tick would otherwise kill a working
+    /// pairing right after it succeeded. Only a run of failures marks the
+    /// transport unready.
+    rotation_failures: AtomicU32,
     peripheral: Arc<dyn Peripheral + Send + Sync>,
     /// In-memory mirror of the live peer set keyed by `peer_id`.
     /// `BTreeMap` so iteration order is deterministic across runs
@@ -597,6 +607,7 @@ impl Orchestrator {
         Self {
             peripheral,
             transport_ready: AtomicBool::new(false),
+            rotation_failures: AtomicU32::new(0),
             peers: tokio::sync::Mutex::new(map),
             bonds_file,
             keys_dir,
@@ -707,9 +718,10 @@ impl Orchestrator {
         let snapshot = self.snapshot_peers().await;
         let union = build_uuid_union(&snapshot, minute);
         let result = self.peripheral.set_session_uuids(union.clone()).await;
-        self.transport_ready.store(result.is_ok(), Ordering::Release);
         match result {
             Ok(()) => {
+                self.rotation_failures.store(0, Ordering::Release);
+                self.transport_ready.store(true, Ordering::Release);
                 for (peer_id, _) in &snapshot {
                     let uuid_bytes = session_uuid_for(snapshot_key(&snapshot, peer_id), minute);
                     let uuid = Uuid::from_bytes(uuid_bytes);
@@ -721,6 +733,10 @@ impl Orchestrator {
                 }
             }
             Err(err) => {
+                let failures = self.rotation_failures.fetch_add(1, Ordering::AcqRel) + 1;
+                if failures >= ROTATION_FAILURES_BEFORE_UNREADY {
+                    self.transport_ready.store(false, Ordering::Release);
+                }
                 rotation_warn(&err, minute);
             }
         }
@@ -1306,14 +1322,29 @@ fn parse_signature(bytes: &[u8]) -> Option<Signature> {
 /// discoverable to a phone trying to add a new bond even when no
 /// existing peer is bonded; for an already-bonded host it sits
 /// alongside the per-peer rotating UUIDs.
+/// The UUID set one advertisement carries.
+///
+/// **Pair mode is a mode, not an extra.** While no phone is bonded the
+/// advertisement carries the pair-service UUID and nothing else; once a bond
+/// exists it carries only the session UUIDs. Two consequences, both wanted:
+///
+/// * it fits. A legacy advertisement holds 31 bytes: Flags take 3, one
+///   128-bit UUID takes 16. Pair UUID + session UUID = 35 bytes, and BlueZ
+///   answers that with `Failed to register advertisement` — measured on the
+///   real adapter the moment the first bond landed (`reload trigger=pair`
+///   one second earlier, rotation dead ever after).
+/// * a bonded desktop stops advertising the pair service. The pair watcher
+///   accepts and persists whatever public key arrives on that characteristic,
+///   so leaving it advertised next to a live bond invites drive-by pairing.
 fn build_uuid_union(snapshot: &[(String, [u8; BOND_KEY_BYTES])], minute: i64) -> HashSet<Uuid> {
-    let mut set: HashSet<Uuid> = snapshot
+    if snapshot.is_empty() {
+        let pair_uuid = Uuid::from_bytes(session_uuid_for(&PAIR_MODE_ZERO_BOND_KEY, minute));
+        return [pair_uuid].into_iter().collect();
+    }
+    snapshot
         .iter()
         .map(|(_id, key)| Uuid::from_bytes(session_uuid_for(key, minute)))
-        .collect();
-    let pair_uuid = Uuid::from_bytes(session_uuid_for(&PAIR_MODE_ZERO_BOND_KEY, minute));
-    set.insert(pair_uuid);
-    set
+        .collect()
 }
 
 /// Zero bond key used to derive the pair-mode advertise UUID. The

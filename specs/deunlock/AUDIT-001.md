@@ -386,3 +386,62 @@ hello = MAC под `derive_auth_mac_key(bond_key)` над
 
 **Осталось в D-07:** телефонная половина — сканер QR и сохранение пина; на
 устройстве ничего из этого ещё не запускалось.
+
+## Живой прогон с настоящим телефоном (Redmi 2322PCD1G, HyperOS 3.0 / Android 16)
+
+Telephone pair against the daemon, no test doubles. Two real defects fell out
+of the run, both invisible to the test suite because the fakes never model
+BlueZ wire limits or advertisement-slot lifetime.
+
+### D-08 (high) — the pair watcher accepts any phone, and the LESC digits go nowhere
+
+`deunlock-presenced` registers the pair service unconditionally and, on an
+incoming public key, derives a bond and persists it. There is no out-of-band
+confirmation and no operator presence check: the four-emoji/one-time-code step
+that `deunlock pair` (CLI) enforces does not exist in the daemon path.
+
+The LESC numeric comparison is also a formality. The BlueZ agent used to be:
+
+```rust
+request_confirmation: Some(Box::new(|_req| Box::pin(async move { Ok(()) })))
+```
+
+`RequestConfirmation.passkey` was discarded, so the phone asked the operator
+"Do these match?" while the desktop displayed nothing to compare against. The
+handler now logs the passkey at `warn` — a headless daemon has no other channel
+— so the comparison is at least *possible*. Making it *mandatory* (refusing a
+bond whose digits nobody confirmed) is still open: it needs a decision about
+whether the daemon may block on operator presence, and where that answer is
+entered.
+
+Mitigation in this commit: once any bond exists the pair-mode UUID is no longer
+advertised (see D-09), so a bonded desktop stops inviting new phones. A phone
+that connects to the pair service anyway is still accepted without OOB.
+
+### D-09 (high) — a second 128-bit UUID made every rotation after pairing fail
+
+`build_uuid_union` always added the pair-mode UUID on top of the session UUIDs.
+A legacy advertisement holds 31 bytes: Flags take 3, one 128-bit UUID takes 16.
+Pair UUID + session UUID is 35 bytes, so BlueZ rejected the registration with
+`Failed to register advertisement` — starting exactly one second after the first
+bond was written, i.e. right after the very first successful pairing:
+
+```
+pair: bond persisted; orchestrator reload requested peer_id=d522633e...
+reload trigger=pair peers_before=0 peers_after=1
+WARN rotation failed error=advertise: Failed to register advertisement
+ERROR daemon exited with error=Bluetooth transport unavailable
+```
+
+Pair mode is now a *mode*: no bonds → pair UUID only; bonded → session UUIDs
+only. This also tightens D-08: pair mode stops being discoverable once the
+desktop has a phone.
+
+### D-10 (medium) — one lost advertisement race killed the daemon
+
+Registration is asynchronous on the BlueZ side, so a rotation that drops the old
+advertisement and immediately registers the new one can lose the race. The code
+retried zero times and treated the error as fatal: `transport_ready` went false
+on the first failure, the run loop drained, and the process exited — two seconds
+after a successful bond. Rotations now retry five times with a 60 ms backoff,
+and readiness only drops after three consecutive failed ticks.

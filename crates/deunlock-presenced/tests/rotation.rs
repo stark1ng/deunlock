@@ -112,14 +112,14 @@ async fn rotates_at_minute_boundary() {
         "expected {expected_count} set_session_uuids calls (1 construction + {TICKS} ticks), got {}",
         calls.len()
     );
-    // Each recorded UUID set is a 2-element set: the bonded peer's
-    // `session_uuid_for(bond_key, minute)` PLUS the always-present
-    // pair-mode UUID derived from the zero bond key for the same
-    // minute. Deriving the exact minute index from the test's
-    // virtual clock requires reading `SystemTime::now()`, which the
-    // paused tokio clock does not control, so we assert the values
-    // belong to the expected sequence around the wall-clock instant
-    // the test ran.
+    // Each recorded UUID set holds exactly the bonded peer's
+    // `session_uuid_for(bond_key, minute)` — pair mode is off while a bond
+    // exists, both because two 128-bit UUIDs overrun the 31-byte legacy
+    // advertisement and because a bonded desktop should not stay
+    // discoverable as pairable. Deriving the exact minute index from the
+    // test's virtual clock requires reading `SystemTime::now()`, which the
+    // paused tokio clock does not control, so we assert the values belong to
+    // the expected sequence around the wall-clock instant the test ran.
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock after epoch")
@@ -127,19 +127,23 @@ async fn rotates_at_minute_boundary() {
     let now_minute = i64::try_from(now_secs / SECONDS_PER_MINUTE).expect("minute fits in i64");
     let zero_bond = [0u8; deunlock_transport::BOND_KEY_BYTES];
     let allowed: HashSet<Uuid> = (now_minute - 2..=now_minute + 2)
-        .flat_map(|m| {
-            [
-                Uuid::from_bytes(session_uuid_for(&BOND_KEY, m)),
-                Uuid::from_bytes(session_uuid_for(&zero_bond, m)),
-            ]
-        })
+        .map(|m| Uuid::from_bytes(session_uuid_for(&BOND_KEY, m)))
+        .collect();
+    let pair_uuids: HashSet<Uuid> = (now_minute - 2..=now_minute + 2)
+        .map(|m| Uuid::from_bytes(session_uuid_for(&zero_bond, m)))
         .collect();
     for (i, recorded) in calls.iter().enumerate() {
         assert_eq!(
             recorded.len(),
-            2,
-            "call #{i} should be a 2-element UUID set (peer + pair), got {recorded:?}"
+            1,
+            "call #{i} should be a single-UUID set (bonded peer only), got {recorded:?}"
         );
+        for uuid in recorded {
+            assert!(
+                !pair_uuids.contains(uuid),
+                "call #{i} still advertises the pair-mode UUID {uuid}"
+            );
+        }
         for uuid in recorded {
             assert!(
                 allowed.contains(uuid),
@@ -310,8 +314,15 @@ async fn advertising_makes_transport_ready_without_a_phone() {
     assert!(ready);
 }
 
+/// A single lost `Advertise` is a race with bluetoothd, not an outage.
+///
+/// Measured on the real adapter: the tick that fired one second after a
+/// successful pairing failed to register the rotation advertisement because
+/// BlueZ had not released the previous slot yet. Treating that as fatal shut
+/// the daemon down seconds after a working bond was written. Readiness now
+/// survives isolated failures and only drops on a run of them.
 #[tokio::test(start_paused = true)]
-async fn failed_advertisement_clears_readiness() {
+async fn one_failed_advertisement_keeps_readiness() {
     let fake = FakePeripheral::new();
     let start = tokio::time::Instant::now() + Duration::from_secs(SECONDS_PER_MINUTE);
     let orchestrator = Arc::new(Orchestrator::new(fake.clone(), fixture_bond(), BOND_KEY, start));
@@ -325,7 +336,28 @@ async fn failed_advertisement_clears_readiness() {
     let ready = orchestrator.transport_ready();
     tx.send(()).expect("shutdown");
     handle.await.expect("join");
-    assert!(!ready);
+    assert!(ready, "one failed rotation must not clear readiness");
+}
+
+/// Three failures in a row is an adapter that is genuinely gone.
+#[tokio::test(start_paused = true)]
+async fn repeated_failed_advertisements_clear_readiness() {
+    let fake = FakePeripheral::new();
+    let start = tokio::time::Instant::now() + Duration::from_secs(SECONDS_PER_MINUTE);
+    let orchestrator = Arc::new(Orchestrator::new(fake.clone(), fixture_bond(), BOND_KEY, start));
+    let (tx, rx) = oneshot::channel();
+    let handle = tokio::spawn(orchestrator.clone().run(rx));
+    tokio::task::yield_now().await;
+    assert!(orchestrator.transport_ready());
+    fake.set_transport_failed(true);
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(SECONDS_PER_MINUTE)).await;
+        tokio::task::yield_now().await;
+    }
+    let ready = orchestrator.transport_ready();
+    tx.send(()).expect("shutdown");
+    handle.await.expect("join");
+    assert!(!ready, "three failed rotations in a row must clear readiness");
 }
 
 #[tokio::test]

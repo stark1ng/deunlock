@@ -172,14 +172,14 @@ async fn three_bonds_advertise_three_uuids() {
 
     let calls = fake.session_uuid_calls();
     let last = calls.last().expect("at least one set_session_uuids call after reload");
-    // Advertised set carries one entry per bonded peer PLUS the
-    // always-present pair-mode UUID (derived from the zero bond
-    // key for the current minute) so a phone can pair against this
-    // host without needing an existing bond.
+    // The moment a bond exists the advertisement is session UUIDs only:
+    // pair UUID + session UUID is 35 bytes of advertisement data and BlueZ
+    // refuses to register that (measured on the real adapter), and pair mode
+    // has no business being discoverable next to a live bond.
     assert_eq!(
         last.len(),
-        4,
-        "advertised UUID set must carry one entry per bonded peer plus the pair-mode UUID, got {last:?}"
+        3,
+        "advertised UUID set must carry exactly one entry per bonded peer, got {last:?}"
     );
     // The minute integer used inside the orchestrator may differ
     // from `current_minute()` by one if the test crossed a wall-
@@ -193,10 +193,14 @@ async fn three_bonds_advertise_three_uuids() {
         for p in &peers {
             window.insert(Uuid::from_bytes(session_uuid_for(&p.bond_key, m)));
         }
-        window.insert(Uuid::from_bytes(session_uuid_for(&zero_bond, m)));
     }
     for u in last.iter() {
         assert!(window.contains(u), "advertised UUID {u} not in expected window");
+        let pair_uuid = Uuid::from_bytes(session_uuid_for(&zero_bond, minute));
+        assert_ne!(
+            *u, pair_uuid,
+            "bonded desktop must not keep advertising the pair-mode UUID"
+        );
     }
     assert!(last.is_subset(&window), "every advertised UUID must be in the expected window");
 }
@@ -252,11 +256,11 @@ async fn reload_removes_revoked_bond() {
     );
     let calls = fake.session_uuid_calls();
     let last = calls.last().expect("at least one set_session_uuids after reload");
-    // Two remaining bonded peers + the always-present pair-mode UUID.
+    // Two remaining bonded peers, and nothing else.
     assert_eq!(
         last.len(),
-        3,
-        "advertised UUID set must carry one entry per remaining bonded peer plus the pair-mode UUID, got {last:?}"
+        2,
+        "advertised UUID set must carry exactly one entry per remaining bonded peer, got {last:?}"
     );
     // The revoked peer's UUID must not appear in the last advertised
     // set under any minute in the surrounding 2-minute window.
