@@ -195,12 +195,39 @@ where
 {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(code) => code,
-        Err(_) => {
-            log_info(PANIC_LOG_LINE);
+        Err(payload) => {
+            // `reason=panic` is the contract (`grep reason=panic` must keep
+            // working); the payload is the diagnosis. Without it a panic in
+            // production reads as "something went wrong" with no way to tell
+            // which `expect` fired (AUDIT-001 D-29).
+            log_info(&format!("{PANIC_LOG_LINE} detail={}", panic_detail(payload.as_ref())));
             PAM_AUTH_ERR
         }
     }
 }
+
+/// The message a panic carried, flattened to one log-safe token.
+///
+/// A `panic!` payload is a `&str` or a `String`; anything else (a panic with a
+/// custom payload) becomes `<non-string payload>`. Control characters become
+/// spaces so one panic cannot forge extra syslog lines, and the result is
+/// bounded: a panic message is a diagnosis, not a data dump.
+fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
+    let raw = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string payload>".to_owned());
+    raw.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_PANIC_DETAIL_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// Longest panic message written to syslog, in characters.
+const MAX_PANIC_DETAIL_CHARS: usize = 200;
 
 // -----------------------------------------------------------------------------
 // PAM exported entry points
@@ -439,6 +466,26 @@ mod tests {
     #[test]
     fn stub_log_line_is_exact() {
         assert_eq!(STUB_LOG_LINE, "deunlock: unlock unavailable reason=stub");
+    }
+
+    /// A panic's message reaches syslog, flattened and bounded.
+    ///
+    /// `reason=panic` alone says "something went wrong" and nothing else; the
+    /// payload is what names the `expect` that fired (AUDIT-001 D-29).
+    #[test]
+    fn a_panic_message_is_kept_as_one_log_token() {
+        let rendered = catch_unwind(|| panic!("challenge body_bytes: too short"))
+            .expect_err("the closure must panic");
+        assert_eq!(panic_detail(rendered.as_ref()), "challenge body_bytes: too short");
+
+        let multiline: Box<dyn std::any::Any + Send> = Box::new("one\ntwo\r\nthree".to_string());
+        assert_eq!(panic_detail(multiline.as_ref()), "one two  three");
+
+        let huge: Box<dyn std::any::Any + Send> = Box::new("x".repeat(500));
+        assert_eq!(panic_detail(huge.as_ref()).chars().count(), MAX_PANIC_DETAIL_CHARS);
+
+        let odd: Box<dyn std::any::Any + Send> = Box::new(42u8);
+        assert_eq!(panic_detail(odd.as_ref()), "<non-string payload>");
     }
 
     /// Formatter sets the syslog tag and facility documented in the journey.

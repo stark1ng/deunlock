@@ -1091,9 +1091,10 @@ Fail-closed (`PAM_AUTH_ERR`, and with `sufficient` the stack continued to
 recurred: every later invocation — `sudo`, `pamtester`, the lock screen — logged
 a normal verdict, and the same commands run by hand do not reproduce it.
 
-What is missing is the *reason*: `run_entry` logs that a panic happened and
-throws the payload away, and the panic message went to a stderr that is not in
-the journal. Next step is to log the payload (`catch_unwind` returns
-`&str`/`String` for a `panic!` and there is no reason to discard it), which is a
-one-line change to the panic boundary; until it reproduces with that in place,
-the honest state is "two fail-closed panics, cause unknown".
+What was missing was the *reason*: `run_entry` logged that a panic happened and
+threw the payload away, and the panic message went to a stderr the journal never
+saw. That is fixed — the boundary now logs the payload, flattened to one token
+and bounded at 200 characters, so `reason=panic detail=…` names the `expect`
+that fired (`entry.rs::a_panic_message_is_kept_as_one_log_token`). Until it
+reproduces with that in place, the honest state is "two fail-closed panics,
+cause unknown".
