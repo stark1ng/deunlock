@@ -236,6 +236,17 @@ class PersistentGattClientTest {
         val callsAfterGivingUp = opener.openCalls
         shadowOf(Looper.getMainLooper()).idleFor(PersistentGattClient.RECONNECT_INTERVAL_MS * 3, TimeUnit.MILLISECONDS)
         assertEquals("a forgotten bond must not keep burning the radio", callsAfterGivingUp, opener.openCalls)
+
+        // A re-pair clears the marker. The client must come back on its own: it
+        // used to stop() outright, so the phone stayed deaf until the process
+        // died, and the first unlock after pairing failed with 'not connected'.
+        marker.delete()
+        shadowOf(Looper.getMainLooper()).idleFor(PersistentGattClient.FORGOTTEN_RECHECK_MS + 1000, TimeUnit.MILLISECONDS)
+
+        assertTrue(
+            "a cleared marker must resume the channel without a process restart",
+            opener.openCalls > callsAfterGivingUp,
+        )
         client.stop()
     }
 

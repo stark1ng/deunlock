@@ -188,6 +188,13 @@ public class PersistentGattClient internal constructor(
     private var missingServiceAttempts: Int = 0
 
     /**
+     * The bond was declared forgotten by the desktop: no radio work until the
+     * marker disappears. A stopped client never came back after a re-pair, so
+     * this is a parked state with a slow re-check rather than a stop.
+     */
+    private var forgottenBackoff: Boolean = false
+
+    /**
      * Bound connection setup through discovery and CCCD acknowledgement. A
      * successful ACL connection alone is not an operational unlock channel.
      * Android autoConnect remains active between retries; radio enable bypasses
@@ -197,6 +204,18 @@ public class PersistentGattClient internal constructor(
     private val reconnectRunnable: Runnable = object : Runnable {
         override fun run() {
             if (stopped.get()) return
+            if (forgottenBackoff) {
+                // Parked: a bond the desktop does not know. Check whether a new
+                // pairing cleared that, and never touch the radio while it holds
+                // (AUDIT-001 D-26).
+                if (forgottenBondStillHeld()) {
+                    reconnectHandler.postDelayed(this, FORGOTTEN_RECHECK_MS)
+                    return
+                }
+                Log.i(PERSISTENT_GATT_LOG_TAG, "forgotten-bond marker cleared; resuming the channel")
+                forgottenBackoff = false
+                missingServiceAttempts = 0
+            }
             Log.i(
                 PERSISTENT_GATT_LOG_TAG,
                 "watchdog: setup incomplete after ${RECONNECT_INTERVAL_MS}ms — forcing reconnect"
@@ -214,6 +233,12 @@ public class PersistentGattClient internal constructor(
     public fun start() {
         stopped.set(false)
         if (!runCatching { adapter.isEnabled }.getOrDefault(false)) return
+        if (forgottenBackoff && forgottenBondStillHeld()) {
+            Log.i(PERSISTENT_GATT_LOG_TAG, "start: bond is forgotten by the desktop; parked")
+            reconnectHandler.removeCallbacks(reconnectRunnable)
+            reconnectHandler.postDelayed(reconnectRunnable, FORGOTTEN_RECHECK_MS)
+            return
+        }
         if (gatt.get() != null) return
         reconnectHandler.removeCallbacks(reconnectRunnable)
         reconnectHandler.postDelayed(reconnectRunnable, RECONNECT_INTERVAL_MS)
@@ -232,6 +257,10 @@ public class PersistentGattClient internal constructor(
         }
         gatt.set(handle)
     }
+
+    /** Does the marker still say the desktop does not know this bond? */
+    private fun forgottenBondStillHeld(): Boolean =
+        com.sy.deunlock.android.bond.DesktopForgotMarker.isMarked(context.filesDir)
 
     /**
      * Tear down the GATT connection. Idempotent — a second call
@@ -374,7 +403,9 @@ public class PersistentGattClient internal constructor(
                             "treating the bond as forgotten by the desktop",
                     )
                     com.sy.deunlock.android.bond.DesktopForgotMarker.mark(context.filesDir)
-                    stop()
+                    forgottenBackoff = true
+                    reconnectHandler.removeCallbacks(reconnectRunnable)
+                    reconnectHandler.postDelayed(reconnectRunnable, FORGOTTEN_RECHECK_MS)
                     return
                 }
                 Log.w(PERSISTENT_GATT_LOG_TAG, "challenge characteristic not present; retrying discovery")
@@ -394,6 +425,7 @@ public class PersistentGattClient internal constructor(
             val ok = runCatching { g.writeDescriptor(cccd) }.getOrDefault(false)
             Log.i(PERSISTENT_GATT_LOG_TAG, "subscribed: writeDescriptor=$ok")
             missingServiceAttempts = 0
+            forgottenBackoff = false
             com.sy.deunlock.android.bond.DesktopForgotMarker.clear(context.filesDir)
         }
 
@@ -482,6 +514,13 @@ public class PersistentGattClient internal constructor(
          * without letting a stale bond spin forever.
          */
         internal const val FORGOTTEN_BOND_ATTEMPTS: Int = 3
+
+        /**
+         * How often a parked client asks whether a new pairing cleared the
+         * marker. Long enough to be free, short enough that a re-pair does not
+         * look broken for a minute.
+         */
+        internal const val FORGOTTEN_RECHECK_MS: Long = 30_000L
 
         /**
          * The `autoConnect` flag the production code always passes

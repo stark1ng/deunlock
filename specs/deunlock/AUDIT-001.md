@@ -864,6 +864,15 @@ can unlock that computer" is withdrawn, and a completed pairing clears the marke
 (`onPairingCompleted`, and a successful subscribe in the client). Verified live on
 2026-11-12 by revoking on the desktop while the phone kept its bond.
 
+**The first version of this fix introduced D-26b.** The client called `stop()` on
+reaching the conclusion, and `stop()` is permanent: nothing restarts it. Pairing
+again cleared the marker and logged `service already running; skip`, the phone
+looked fine, and the daemon answered every prompt with `notification unavailable
+... not connected`, so `pamtester` failed in 32 ms on the password fallback. The
+client now *parks* instead — no radio work, one marker re-check every 30 s — and
+resumes by itself when a new pairing clears the marker. Verified: `pamtester
+sudo roma authenticate` → `successfully authenticated` in 3.9 s.
+
 ### Product loop verified end to end (2026-11-12)
 
 systemd user service (`deunlock-presenced.service`, `Restart=on-failure`) →
