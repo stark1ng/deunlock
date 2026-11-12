@@ -1280,3 +1280,23 @@ arithmetic, the tone thresholds and every raw sensor string). On the device:
 and the rendered prompt is `assets/screenshots/approve-prompt.png`: ring at 28 of
 30, `WAITING FOR YOU`, `deunlock is requesting sudo (peer_id C2:0E:51)`, Approve /
 Cancel.
+
+### W-3, second pass — one prompt for both surfaces
+
+The phone asks the same question in two places: the activity over the keyguard when
+a challenge arrives, and the in-app route a notification tap lands on. They had two
+different layouts — a ring in one, a lock icon and a countdown sentence in the
+other — which is exactly the drift the project's own rule forbids.
+
+Both now build an `ApprovalVisual` and render it through `approve.ApprovalSurface`:
+ring, terminal headline, the sentence naming the computer, the reason as words, and
+the two actions while the question is open. The surfaces own only their own state
+mapping (`ApprovalScreenState.toVisual` and `ApproveUiState.toVisual`), the labels
+differ where the words honestly differ (the popup says Cancel, the route says Deny),
+and the test tags moved into the shared surface so one harness drives both.
+
+Measured: same 151 Android unit tests green, `compileDebugAndroidTestKotlin` green
+(the instrumented `ApproveScreenTest` still finds its tags), and the live popup
+after the refactor is the same screen: ring at 29/30, `WAITING FOR YOU`,
+`deunlock is requesting sudo (peer_id C2:0E:51)`, Approve / Cancel
+(`assets/screenshots/approve-prompt.png`).

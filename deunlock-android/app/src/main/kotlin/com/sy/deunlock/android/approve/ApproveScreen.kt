@@ -1,119 +1,61 @@
 // Roadmap item S-017 — Approve screen Compose UI.
 //
-// Renders the user-facing surface for every unlock. Layout follows
-// the prrr-android MainScreen pattern so the sibling apps share
-// visual identity:
+// Renders the in-app route that a notification tap lands on. The layout itself
+// lives in `ApprovalSurface` (shared with the over-keyguard activity, so the
+// operator sees one prompt rather than two): ring around the remaining seconds,
+// terminal-style headline, the sentence naming the computer, and the two actions.
 //
-//   - `Scaffold` + `TopAppBar` with the app name as title.
-//   - App icon (Material lock icon) centred near the top.
-//   - Hostname header — "Approve unlock for <hostname>?"
-//   - Countdown line — "Approve within Xs" (rendered only while the
-//     state is `Counting`).
-//   - `Approve` — full-width primary button on the theme background
-//     (white-on-black, matching prrr's Connect button).
-//   - `Deny`    — full-width outlined button below, error-tint text.
-//   - Terminal status line — "Unlock approved." or "Denied: <reason>"
-//     while the state is `Approved` or `Denied`.
+// This file owns only what is specific to the route: mapping the ViewModel's state
+// onto an [ApprovalVisual], starting the countdown once, and dismissing after the
+// verdict has been readable.
 //
-// The screen is a pure function of `ApproveUiState`. All side-effects
-// (start the countdown, dispatch Approve, dispatch Deny) flow through
-// the `ApproveViewModel` injected as a parameter.
+// The screen is a pure function of `ApproveUiState`. All side-effects (start the
+// countdown, dispatch Approve, dispatch Deny) flow through the `ApproveViewModel`
+// injected as a parameter.
 package com.sy.deunlock.android.approve
 
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import kotlinx.coroutines.delay
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.testTag
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-
-/**
- * Test tags attached to the major nodes so the androidTest harness can
- * find them without depending on the rendered strings (which are
- * locale- and config-dependent in future iterations).
- */
-public object ApproveScreenTestTags {
-    public const val HOSTNAME: String = "deunlock.approve.hostname"
-    public const val APPROVE_BUTTON: String = "deunlock.approve.approve_button"
-    public const val DENY_BUTTON: String = "deunlock.approve.deny_button"
-    public const val COUNTDOWN: String = "deunlock.approve.countdown"
-    public const val TERMINAL: String = "deunlock.approve.terminal"
-}
+import com.sy.deunlock.android.bg.ApprovalTone
+import com.sy.deunlock.android.bg.URGENT_SECONDS
+import com.sy.deunlock.android.bg.WARNING_SECONDS
+import kotlinx.coroutines.delay
 
 /** Maximum hostname length rendered. Excess is ellipsized. */
 private const val HOSTNAME_MAX_CHARS: Int = 64
-
-/** Screen padding. */
-private val SCREEN_PADDING_DP = 24.dp
-
-/** Vertical spacing between major sections. */
-private val SECTION_SPACING_DP = 16.dp
-
-/** App-icon size at the top of the screen. */
-private val APP_ICON_SIZE_DP = 72.dp
-
-/** Vertical spacing between the Approve and Deny buttons. */
-private val BUTTON_SPACING_DP = 12.dp
-
-/**
- * Action-button height. Matches prrr-android's
- * MainScreen Connect button (56.dp) so the two siblings share the
- * primary-CTA proportions.
- */
-private val BUTTON_HEIGHT_DP = 56.dp
-
-/** Horizontal inset around the full-width action buttons. */
-private val BUTTON_HORIZONTAL_PADDING_DP = 24.dp
 
 /** Title surfaced in the TopAppBar. Centralised so tests can assert on it. */
 public const val APPROVE_SCREEN_TITLE: String = "deunlock"
 
 /**
- * Dwell time on the `Approved` terminal state before the activity
- * dismisses itself. Long enough that the user sees "Unlock approved"
- * as confirmation, short enough that it does not feel like a stall.
+ * Dwell time on the `Approved` terminal state before the route dismisses itself.
+ * Long enough that the user sees `ACCESS GRANTED` as confirmation, short enough
+ * that it does not feel like a stall.
  */
-public const val APPROVED_DISMISS_DELAY_MILLIS: Long = 1_500L
+public const val APPROVED_DISMISS_DELAY_MILLIS: Long = 1_200L
 
 /**
- * Dwell time on the `Denied` terminal state. Longer than the Approved
- * dwell so the user has time to read the reason ("timed out", "user
- * denied", etc.) before the activity dismisses.
+ * Dwell time on the `Denied` terminal state. Longer than the approved dwell so the
+ * user has time to read the reason before the route dismisses.
  */
-public const val DENIED_DISMISS_DELAY_MILLIS: Long = 2_500L
+public const val DENIED_DISMISS_DELAY_MILLIS: Long = 2_200L
 
 /**
- * Render the Approve screen for [viewModel]. The composable is a pure
- * function of `viewModel.uiState`; every action flows back through
- * `viewModel.onApproveClicked` / `viewModel.onDenyClicked`. When the
- * state reaches a terminal value (Approved / Denied), [onDismiss] is
- * invoked after a short confirmation dwell so the host activity can
- * `finish()` itself and return the user to the previous foreground.
+ * Render the Approve route for [viewModel]. When the state reaches a terminal
+ * value, [onDismiss] is invoked after a short confirmation dwell so the host
+ * activity can return to the previous foreground.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -123,18 +65,14 @@ public fun ApproveScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
 
-    // Start the countdown exactly once when the screen enters
-    // composition. `LaunchedEffect(Unit)` keys to the screen lifecycle.
+    // Start the countdown exactly once when the screen enters composition.
     LaunchedEffect(Unit) {
         viewModel.start()
     }
 
-    // Auto-dismiss on a terminal state. The delay gives the user time
-    // to read the confirmation; once it elapses, [onDismiss] is
-    // called exactly once per terminal transition. Keying on
-    // `state::class` (not the whole instance) means a value change
-    // inside the same terminal variant — none today — would not
-    // restart the timer.
+    // Auto-dismiss on a terminal state, once per transition: keying on the class
+    // means a value change inside the same terminal variant would not restart the
+    // timer.
     LaunchedEffect(state::class) {
         when (state) {
             is ApproveUiState.Approved -> {
@@ -149,12 +87,6 @@ public fun ApproveScreen(
         }
     }
 
-    val safeHostname = sanitizeHostname(viewModel.hostname)
-    // v2 challenges name the service and the account ("sudo · roma"); v1 frames
-    // carry neither, and the line is then omitted entirely.
-    val requestLabel = (state as? ApproveUiState.Counting)?.requestLabel.orEmpty()
-    val approveEnabled = state is ApproveUiState.Counting
-
     Scaffold(
         topBar = {
             TopAppBar(
@@ -167,139 +99,100 @@ public fun ApproveScreen(
         },
         containerColor = MaterialTheme.colorScheme.background,
     ) { paddingValues ->
-        Column(
+        Surface(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(paddingValues)
-                .padding(horizontal = SCREEN_PADDING_DP),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Top,
+                .padding(paddingValues),
+            color = MaterialTheme.colorScheme.background,
         ) {
-            Spacer(modifier = Modifier.height(SECTION_SPACING_DP))
-            Icon(
-                imageVector = Icons.Filled.Lock,
-                contentDescription = null,
-                modifier = Modifier.size(APP_ICON_SIZE_DP),
-                tint = MaterialTheme.colorScheme.primary,
-            )
-            Spacer(modifier = Modifier.height(SECTION_SPACING_DP))
-            Text(
-                text = "Approve unlock for $safeHostname?",
-                style = MaterialTheme.typography.headlineSmall,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                color = MaterialTheme.colorScheme.onBackground,
-                modifier = Modifier.semantics { testTag = ApproveScreenTestTags.HOSTNAME },
-            )
-            if (requestLabel.isNotEmpty()) {
-                Spacer(modifier = Modifier.height(SECTION_SPACING_DP))
-                Text(
-                    text = requestLabel,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            Spacer(modifier = Modifier.height(SECTION_SPACING_DP))
-            CountdownRow(state)
-            Spacer(modifier = Modifier.weight(1f))
-            ButtonStack(
-                approveEnabled = approveEnabled,
+            ApprovalSurface(
+                visual = state.toVisual(viewModel.hostname),
+                approveEnabled = state is ApproveUiState.Counting,
                 onApprove = viewModel::onApproveClicked,
                 onDeny = viewModel::onDenyClicked,
+                labels = ApprovalActionLabels(approve = "Approve", deny = "Deny"),
             )
-            Spacer(modifier = Modifier.height(SECTION_SPACING_DP))
-            TerminalMessage(state)
-            Spacer(modifier = Modifier.height(SECTION_SPACING_DP))
         }
     }
 }
 
-@Composable
-private fun CountdownRow(state: ApproveUiState) {
-    val text = when (state) {
-        is ApproveUiState.Counting -> "Approve within ${state.remainingSeconds}s"
-        ApproveUiState.AwaitingBiometric -> "Awaiting biometric…"
-        ApproveUiState.Signing -> "Signing…"
-        else -> ""
+/**
+ * The ViewModel's state as something to draw.
+ *
+ * The countdown is the ViewModel's own budget (`DEFAULT_TIMEOUT_MILLIS`, 30 s) —
+ * the same number the popup uses, so the ring means the same thing on both
+ * surfaces.
+ */
+internal fun ApproveUiState.toVisual(hostname: String): ApprovalVisual {
+    val safeHostname = sanitizeHostname(hostname)
+    val requestLabel = (this as? ApproveUiState.Counting)?.requestLabel.orEmpty()
+    val prompt = if (requestLabel.isEmpty()) {
+        "Approve unlock for $safeHostname?"
+    } else {
+        "Approve unlock for $safeHostname?\n$requestLabel"
     }
-    Text(
-        text = text,
-        style = MaterialTheme.typography.bodyLarge,
-        modifier = Modifier.semantics { testTag = ApproveScreenTestTags.COUNTDOWN },
+    return when (this) {
+        ApproveUiState.Idle -> ApprovalVisual(
+            headline = "WAITING FOR YOU",
+            prompt = prompt,
+            secondsLeft = null,
+            fractionRemaining = 1f,
+            tone = ApprovalTone.Calm,
+        )
+        is ApproveUiState.Counting -> ApprovalVisual(
+            headline = "WAITING FOR YOU",
+            prompt = prompt,
+            secondsLeft = remainingSeconds,
+            fractionRemaining = remainingSeconds.toFloat() / DEFAULT_TIMEOUT_SECONDS,
+            tone = when {
+                remainingSeconds <= URGENT_SECONDS -> ApprovalTone.Urgent
+                remainingSeconds <= WARNING_SECONDS -> ApprovalTone.Warning
+                else -> ApprovalTone.Calm
+            },
+        )
+        ApproveUiState.AwaitingBiometric -> stepVisual(prompt, "touch the sensor", "SENSOR OPEN")
+        ApproveUiState.Signing -> stepVisual(prompt, "signing on the phone", "SIGNING")
+        is ApproveUiState.Approved -> ApprovalVisual(
+            headline = "ACCESS GRANTED",
+            prompt = prompt,
+            secondsLeft = null,
+            fractionRemaining = 1f,
+            tone = ApprovalTone.Verdict,
+            actionsVisible = false,
+        )
+        is ApproveUiState.Denied -> ApprovalVisual(
+            headline = "DENIED",
+            prompt = prompt,
+            secondsLeft = null,
+            fractionRemaining = 1f,
+            tone = ApprovalTone.Verdict,
+            detail = denialReasonLabel(reason),
+            actionsVisible = false,
+        )
+    }
+}
+
+/** A step between tapping and the verdict: no countdown, no actions, one line of what is happening. */
+private fun stepVisual(prompt: String, detail: String, headline: String): ApprovalVisual =
+    ApprovalVisual(
+        headline = headline,
+        prompt = prompt,
+        secondsLeft = null,
+        fractionRemaining = 1f,
+        tone = ApprovalTone.Calm,
+        detail = detail,
+        actionsVisible = false,
     )
-}
 
-@Composable
-private fun ButtonStack(
-    approveEnabled: Boolean,
-    onApprove: () -> Unit,
-    onDeny: () -> Unit,
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = BUTTON_HORIZONTAL_PADDING_DP),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Button(
-            onClick = onApprove,
-            enabled = approveEnabled,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(BUTTON_HEIGHT_DP)
-                .semantics { testTag = ApproveScreenTestTags.APPROVE_BUTTON },
-            colors = ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary,
-            ),
-        ) {
-            Text(
-                text = "Approve",
-                style = MaterialTheme.typography.titleMedium,
-            )
-        }
-        Spacer(modifier = Modifier.height(BUTTON_SPACING_DP))
-        OutlinedButton(
-            onClick = onDeny,
-            enabled = approveEnabled,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(BUTTON_HEIGHT_DP)
-                .semantics { testTag = ApproveScreenTestTags.DENY_BUTTON },
-            colors = ButtonDefaults.outlinedButtonColors(
-                contentColor = MaterialTheme.colorScheme.error,
-            ),
-        ) {
-            Text(
-                text = "Deny",
-                style = MaterialTheme.typography.titleMedium,
-            )
-        }
-    }
-}
-
-@Composable
-private fun TerminalMessage(state: ApproveUiState) {
-    val text = when (state) {
-        is ApproveUiState.Approved -> "Unlock approved."
-        is ApproveUiState.Denied -> "Denied: ${denialReasonLabel(state.reason)}"
-        else -> ""
-    }
-    Text(
-        text = text,
-        style = MaterialTheme.typography.bodyMedium,
-        modifier = Modifier.semantics { testTag = ApproveScreenTestTags.TERMINAL },
-    )
-}
+/** Seconds the ViewModel's countdown starts from, for the ring's fraction. */
+private const val DEFAULT_TIMEOUT_SECONDS: Float = DEFAULT_TIMEOUT_MILLIS / 1_000f
 
 private fun denialReasonLabel(reason: DenialReason): String = when (reason) {
-    DenialReason.UserDenied -> "user denied"
-    DenialReason.TimedOut -> "timed out"
-    DenialReason.BiometricFailed -> "biometric failed"
-    DenialReason.BiometricUnavailable -> "biometric unavailable"
-    is DenialReason.SignError -> "sign error (${reason.reason})"
+    DenialReason.UserDenied -> "you denied it"
+    DenialReason.TimedOut -> "it expired — run the command again"
+    DenialReason.BiometricFailed -> "the sensor did not recognise you"
+    DenialReason.BiometricUnavailable -> "no fingerprint enrolled on this phone"
+    is DenialReason.SignError -> "the phone could not sign — try again (${reason.reason})"
 }
 
 /**

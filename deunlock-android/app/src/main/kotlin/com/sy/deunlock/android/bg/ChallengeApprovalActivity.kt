@@ -116,6 +116,9 @@ import kotlinx.coroutines.launch
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import com.sy.deunlock.android.R
+import com.sy.deunlock.android.approve.ApprovalActionLabels
+import com.sy.deunlock.android.approve.ApprovalSurface
+import com.sy.deunlock.android.approve.ApprovalVisual
 import com.sy.deunlock.android.ui.theme.DeUnlockTheme
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import java.security.KeyStore
@@ -865,44 +868,28 @@ private val APPROVAL_SECTION_SPACING_DP = 16.dp
 /** Vertical gap between the Approve and Cancel buttons. */
 private val APPROVAL_BUTTON_SPACING_DP = 12.dp
 
-/** Diameter of the countdown ring. Big enough to read from an arm's length. */
-private val APPROVAL_RING_SIZE_DP = 200.dp
-
-/** Ring stroke. Thick enough to see the arc shrink without looking for it. */
-private val APPROVAL_RING_STROKE_DP = 10.dp
-
-/** Seconds numeral inside the ring. */
-private val APPROVAL_RING_NUMERAL_SP = 56.sp
-
 /** Primary-button height; matches prrr-android's Connect button (56.dp). */
 private val APPROVAL_BUTTON_HEIGHT_DP = 56.dp
 
 /** Horizontal inset around the full-width Approve / Cancel buttons. */
 private val APPROVAL_BUTTON_HORIZONTAL_PADDING_DP = 24.dp
 
-/** Letter spacing on the terminal-style headline, so the caps read as a token. */
-private const val APPROVAL_HEADLINE_TRACKING_EM: Float = 0.12f
-
-/** Ring colour for a tone. Green is the app's accent, amber warns, red is the last chance. */
-@Composable
-private fun ringColour(state: ApprovalScreenState): Color = when (approvalTone(state)) {
-    ApprovalTone.Calm -> SySuccess
-    ApprovalTone.Warning -> SyWarning
-    ApprovalTone.Urgent -> SyDanger
-    ApprovalTone.Verdict -> if (state.outcome is ApprovalOutcome.Denied) SyDanger else SySuccess
-}
+/** The prompt's state as the shared surface expects it. */
+internal fun ApprovalScreenState.toVisual(): ApprovalVisual = ApprovalVisual(
+    headline = approvalHeadline(this),
+    prompt = promptText,
+    secondsLeft = if (isOpen) remainingSeconds else null,
+    fractionRemaining = fractionRemaining,
+    tone = approvalTone(this),
+    detail = (outcome as? ApprovalOutcome.Denied)?.reason,
+    actionsVisible = isOpen,
+)
 
 /**
  * The prompt the operator sees over the keyguard.
  *
- * A countdown ring around the remaining seconds — the one number that matters
- * when the desktop is waiting — then the headline, the sentence naming the
- * computer and the request, and the two actions. On a verdict the ring and the
- * headline change colour and the buttons disappear, because the question is
- * already answered.
- *
- * @param reduceMotion system animation preference; the ring then renders as a
- *   static arc instead of an animated sweep.
+ * The layout lives in `ApprovalSurface`, shared with the in-app route, so the same
+ * question looks the same whichever way it is asked.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -931,151 +918,18 @@ private fun ApprovalContent(
                     .padding(paddingValues),
                 color = MaterialTheme.colorScheme.background,
             ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(horizontal = APPROVAL_PADDING_DP),
-                    verticalArrangement = Arrangement.Top,
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Spacer(modifier = Modifier.height(APPROVAL_SECTION_SPACING_DP))
-                    val accent = ringColour(state)
-                    Box(
-                        modifier = Modifier.size(APPROVAL_RING_SIZE_DP),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Canvas(modifier = Modifier.fillMaxSize()) {
-                            val stroke = APPROVAL_RING_STROKE_DP.toPx()
-                            val inset = stroke / 2f
-                            val arcSize = Size(size.width - stroke, size.height - stroke)
-                            drawArc(
-                                color = SyBorder,
-                                startAngle = RING_START_ANGLE,
-                                sweepAngle = RING_FULL_SWEEP,
-                                useCenter = false,
-                                topLeft = Offset(inset, inset),
-                                size = arcSize,
-                                style = Stroke(width = stroke),
-                            )
-                            // A finished question keeps a full ring; a live one
-                            // shrinks. With reduced motion asked for, the ring stays
-                            // whole and only the numeral changes — the countdown is
-                            // still readable, nothing moves under the operator.
-                            val sweep = when {
-                                !state.isOpen -> RING_FULL_SWEEP
-                                reduceMotion -> RING_FULL_SWEEP
-                                else -> RING_FULL_SWEEP * state.fractionRemaining
-                            }
-                            drawArc(
-                                color = accent,
-                                startAngle = RING_START_ANGLE,
-                                sweepAngle = sweep,
-                                useCenter = false,
-                                topLeft = Offset(inset, inset),
-                                size = arcSize,
-                                style = Stroke(width = stroke, cap = StrokeCap.Round),
-                            )
-                        }
-                        Text(
-                            text = when (state.outcome) {
-                                null -> state.remainingSeconds.toString()
-                                ApprovalOutcome.Granted -> "OK"
-                                is ApprovalOutcome.Denied -> "!"
-                            },
-                            color = accent,
-                            fontSize = APPROVAL_RING_NUMERAL_SP,
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.semantics {
-                                testTag = APPROVAL_COUNTDOWN_TEST_TAG
-                                contentDescription = if (state.isOpen) {
-                                    "${state.remainingSeconds} seconds left"
-                                } else {
-                                    approvalHeadline(state)
-                                }
-                            },
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(APPROVAL_SECTION_SPACING_DP))
-                    Text(
-                        text = approvalHeadline(state),
-                        color = accent,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = APPROVAL_HEADLINE_TRACKING_EM.em,
-                        textAlign = TextAlign.Center,
-                    )
-                    Spacer(modifier = Modifier.height(APPROVAL_SECTION_SPACING_DP))
-                    Text(
-                        text = state.promptText,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onBackground,
-                        textAlign = TextAlign.Center,
-                    )
-                    (state.outcome as? ApprovalOutcome.Denied)?.let { denied ->
-                        Spacer(modifier = Modifier.height(APPROVAL_SECTION_SPACING_DP))
-                        Text(
-                            text = denied.reason,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = SyTextDim,
-                            textAlign = TextAlign.Center,
-                        )
-                    }
-                    Spacer(modifier = Modifier.weight(1f))
-                    if (state.isOpen) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = APPROVAL_BUTTON_HORIZONTAL_PADDING_DP),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                        ) {
-                            Button(
-                                onClick = onApprove,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(APPROVAL_BUTTON_HEIGHT_DP),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = MaterialTheme.colorScheme.primary,
-                                    contentColor = MaterialTheme.colorScheme.onPrimary,
-                                ),
-                            ) {
-                                Text(
-                                    text = "Approve",
-                                    style = MaterialTheme.typography.titleMedium,
-                                )
-                            }
-                            Spacer(modifier = Modifier.height(APPROVAL_BUTTON_SPACING_DP))
-                            OutlinedButton(
-                                onClick = onCancel,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(APPROVAL_BUTTON_HEIGHT_DP),
-                                colors = ButtonDefaults.outlinedButtonColors(
-                                    contentColor = MaterialTheme.colorScheme.error,
-                                ),
-                            ) {
-                                Text(
-                                    text = "Cancel",
-                                    style = MaterialTheme.typography.titleMedium,
-                                )
-                            }
-                        }
-                    }
-                    Spacer(modifier = Modifier.height(APPROVAL_SECTION_SPACING_DP))
-                }
+                ApprovalSurface(
+                    visual = state.toVisual(),
+                    approveEnabled = state.isOpen,
+                    onApprove = onApprove,
+                    onDeny = onCancel,
+                    reduceMotion = reduceMotion,
+                    labels = ApprovalActionLabels(approve = "Approve", deny = "Cancel"),
+                )
             }
         }
     }
 }
-
-/** Ring starts at twelve o'clock rather than three. */
-private const val RING_START_ANGLE: Float = -90f
-
-/** A full circle in degrees. */
-private const val RING_FULL_SWEEP: Float = 360f
-
-/** Test tag on the numeral inside the ring. */
-internal const val APPROVAL_COUNTDOWN_TEST_TAG: String = "deunlock.approve.countdown"
 
 /**
  * Build a fresh [Intent] that the production
