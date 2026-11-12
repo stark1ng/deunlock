@@ -49,7 +49,7 @@ The parser does not load `/etc/deunlock.conf`. Recognised module arguments:
 | --- | --- |
 | `socket=<path>` | Override the daemon socket |
 | `timeout=<ms>` | PAM-side read budget; values below 1,000 ms are ignored |
-| `choice=<ms>` | Phone-side budget when the caller has a terminal (default 12,000 ms), clipped by `timeout=` |
+| `choice=<ms>` | Phone-side budget when the caller has a terminal (default 25,000 ms), clipped by `timeout=` |
 | `phone=off` | Skip the phone entirely; the next module prompts as usual |
 
 Any other argument is ignored, because PAM stacks routinely carry arguments meant for other modules. `DEUNLOCK_OFF=1` in the environment has the same effect as `phone=off`.
@@ -60,7 +60,7 @@ Any other argument is ignored, because PAM stacks routinely carry arguments mean
 | --- | --- | --- |
 | Daemon challenge response deadline | 25,000 ms | Wait for the phone's response |
 | PAM response read budget | 27,000 ms (`timeout=`) | Bound the blocking RPC read |
-| Phone-side budget while the caller can type | 12,000 ms (`choice=`) | Stop asking once a password is the faster answer |
+| Phone-side budget while the caller can type | 25,000 ms (`choice=`) | Stop asking once a password is the faster answer |
 | Per-peer challenge slot | One | Serialize challenges to one phone |
 | Per-peer queue wait | 1,000 ms | Return `busy` if the slot remains occupied |
 | Daemon concurrent connection cap | Four | Limit simultaneous RPC handlers |

@@ -1116,6 +1116,9 @@ printed its own password prompt, and the operator typed his password — after
 which the phone's approval arrived with nobody waiting (D-27's open half, now
 harmless thanks to D-28).
 
-`DEFAULT_CHOICE_WINDOW` is 12,000 ms. It costs a typist nothing — typing wins
-immediately — and it is still capped by `timeout=` and overridable per service
-with `choice=<ms>`.
+`DEFAULT_CHOICE_WINDOW` is 25,000 ms — the operator's number, and the same one
+the lock screen uses. It is coherent with the far end: the phone's approval
+prompt counts down from 30 s (`DEFAULT_TIMEOUT_MILLIS` in `ApproveViewModel`), so
+the desktop no longer gives up while the prompt is still on the screen. A typist
+pays nothing — typing wins immediately — and the window is still clipped by
+`timeout=` (27 s for `sudo`) and overridable per service with `choice=<ms>`.

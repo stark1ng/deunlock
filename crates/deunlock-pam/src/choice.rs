@@ -60,15 +60,16 @@ pub const CHOICE_PROMPT: &str = "Confirm on your phone, or type your password: "
 
 /// Phone-side budget when the caller can type.
 ///
-/// Measured on the reference phone: ~4 s from the notification to the sensor
-/// answering when the phone is already in hand. Twelve seconds covers the real
-/// case — the notification arrives, the phone is picked up, unlocked and
-/// touched — and costs a typist nothing, because typing wins immediately.
+/// Twenty-five seconds is the operator's number, and it is coherent with the
+/// far end: the phone's own approval prompt counts down from 30 s
+/// (`DEFAULT_TIMEOUT_MILLIS` in `ApproveViewModel`), so the desktop stays inside
+/// the prompt instead of giving up while it is still visible.
 ///
-/// Six seconds (the first value) was too tight: the very first `sudo` after
-/// wiring it expired the window at 6.0 s and fell through to a password prompt
-/// while the phone was still ringing (AUDIT-001 D-30).
-pub const DEFAULT_CHOICE_WINDOW: Duration = Duration::from_millis(12_000);
+/// A typist pays nothing — typing wins immediately — and the window is still
+/// clipped by the module's `timeout=` argument and overridable per service with
+/// `choice=<ms>`. The first value (6 s) was sized for a phone already in hand
+/// and expired while the phone was still ringing (AUDIT-001 D-30).
+pub const DEFAULT_CHOICE_WINDOW: Duration = Duration::from_millis(25_000);
 
 /// Floor for an operator-supplied `choice=<ms>`.
 pub const MIN_CHOICE_WINDOW_MS: u64 = 1_000;
