@@ -34,7 +34,7 @@
 mod health;
 mod notification;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bluer::{
@@ -280,7 +280,22 @@ pub trait Peripheral: Send + Sync {
 /// ships the trait method + buffer; the BlueZ subscription that
 /// pushes onto `response_tx` lives behind the same field name and
 /// closes in a follow-on row).
+/// One peer's session service, built but not yet registered.
+struct PendingPeerService {
+    bond_key: BondKey,
+    service: Service,
+    notify_rx: mpsc::Receiver<DbusNotifier>,
+    resp_control: Pin<Box<dyn futures::Stream<Item = CharacteristicControlEvent> + Send>>,
+    notifier_slot: Arc<NotificationChannel>,
+    response_tx: mpsc::Sender<Vec<u8>>,
+    response_rx: mpsc::Receiver<Vec<u8>>,
+}
+
 struct PeerCharSet {
+    /// The bond this peer's session service was built from. Kept so the service
+    /// tree can be rebuilt from scratch — bluer consumes control handles at
+    /// registration, so every rebuild re-derives them.
+    bond_key: BondKey,
     /// Receiver side of the per-peer response buffer. `Mutex` so the
     /// trait method can take exclusive access to a single shared
     /// receiver without requiring `&mut self`.
@@ -728,102 +743,70 @@ impl PersistentPeripheral {
 // The auto-derived bounds suffice.
 
 impl PersistentPeripheral {
-    /// Build a fresh Service+Characteristic tree for one peer and
-    /// register it. Returns the per-peer state (notifier slot,
-    /// response channel, control-loop task) that `add_peer` stashes
-    /// into `PeerCharSet`. Called fresh on every `add_peer` because
-    /// bluer's `Application` is a snapshot — control_handles are
-    /// consumed by registration and cannot be reused.
-    async fn build_and_register_peer(
-        &self,
-        bond_key: &BondKey,
-    ) -> Result<
-        (
-            Arc<NotificationChannel>,
-            mpsc::Sender<Vec<u8>>,
-            mpsc::Receiver<Vec<u8>>,
-            JoinHandle<()>,
-        ),
-        PeripheralError,
-    > {
-        let (notify_tx, mut notify_rx) = mpsc::channel(RESPONSE_BUFFER_DEPTH);
-        let (mut resp_control, resp_handle) = characteristic_control();
+    /// Build one peer's session service without registering it.
+    ///
+    /// Separate from registration because the whole application is now registered
+    /// in one shot: bluer's `Application` is a snapshot, so adding a peer means
+    /// re-deriving every service tree, not appending to a live one.
+    fn build_peer_service(&self, bond_key: &BondKey) -> PendingPeerService {
+        let (notify_tx, notify_rx) = mpsc::channel(RESPONSE_BUFFER_DEPTH);
+        let (resp_control, resp_handle) = characteristic_control();
         let service_uuid = peer_service_uuid(bond_key);
-        let app = Application {
-            services: vec![Service {
-                uuid: service_uuid,
-                primary: true,
-                characteristics: vec![
-                    Characteristic {
-                        uuid: DEUNLOCK_CHALLENGE_CHAR_UUID,
-                        notify: Some(CharacteristicNotify {
-                            notify: true,
-                            method: peer_notify_method(notify_tx),
-                            ..Default::default()
-                        }),
+        let service = Service {
+            uuid: service_uuid,
+            primary: true,
+            characteristics: vec![
+                Characteristic {
+                    uuid: DEUNLOCK_CHALLENGE_CHAR_UUID,
+                    notify: Some(CharacteristicNotify {
+                        notify: true,
+                        method: peer_notify_method(notify_tx),
                         ..Default::default()
-                    },
-                    Characteristic {
-                        uuid: DEUNLOCK_RESPONSE_CHAR_UUID,
-                        write: Some(CharacteristicWrite {
-                            write: true,
-                            write_without_response: true,
-                            method: CharacteristicWriteMethod::Io,
-                            ..Default::default()
-                        }),
-                        control_handle: resp_handle,
+                    }),
+                    ..Default::default()
+                },
+                Characteristic {
+                    uuid: DEUNLOCK_RESPONSE_CHAR_UUID,
+                    write: Some(CharacteristicWrite {
+                        write: true,
+                        write_without_response: true,
+                        method: CharacteristicWriteMethod::Io,
                         ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            }],
+                    }),
+                    control_handle: resp_handle,
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         };
-        tracing::info!(target: "deunlock_transport", uuid=%service_uuid, "registering GATT app for peer");
-        let new_handle = self
-            .adapter
-            .serve_gatt_application(app)
-            .await
-            .map_err(|err| PeripheralError::Backend {
-                reason: format!("serve_gatt_application: {err}"),
-            })?;
-        tracing::info!(target: "deunlock_transport", "GATT app registration accepted by BlueZ");
-        // Replace the live application registration.
-        let mut slot = self.app_handle.lock().await;
-        *slot = Some(new_handle);
-        drop(slot);
-
-        // Kick any LE peer that survived the previous daemon process
-        // / Application registration. A phone running PersistentGattClient
-        // with `autoConnect=true` keeps the LE link alive across our
-        // `serve_gatt_application` swap, but its CCCD subscription is
-        // bound to the dead application registration — every
-        // `notify_challenge` against it lands on notifier_slot=None.
-        // Forcing a Device::disconnect() drops the link cleanly; the
-        // phone's autoConnect re-establishes it within seconds and
-        // (per the phone-side fix) calls `gatt.refresh()` +
-        // `discoverServices()` so the fresh app's CCCD subscription
-        // takes effect.
-        if let Err(err) = self.kick_connected_peers().await {
-            tracing::warn!(
-                target: "deunlock_transport",
-                error = %err,
-                "kick_connected_peers failed; phones with stale subscriptions may need a manual BT cycle"
-            );
-        }
-
-        let notifier_slot = Arc::new(NotificationChannel::default());
         let (response_tx, response_rx) = mpsc::channel::<Vec<u8>>(RESPONSE_BUFFER_DEPTH);
-        let notifier_slot_for_task = notifier_slot.clone();
-        let response_tx_for_task = response_tx.clone();
-        let task = tokio::spawn(async move {
+        PendingPeerService {
+            bond_key: *bond_key,
+            service,
+            notify_rx,
+            resp_control: Box::pin(resp_control),
+            notifier_slot: Arc::new(NotificationChannel::default()),
+            response_tx,
+            response_rx,
+        }
+    }
+
+    /// Spawn the per-peer control loop (challenge subscribe + response writes).
+    fn spawn_peer_loop(
+        notifier_slot: Arc<NotificationChannel>,
+        mut notify_rx: mpsc::Receiver<DbusNotifier>,
+        mut resp_control: Pin<Box<dyn futures::Stream<Item = CharacteristicControlEvent> + Send>>,
+        response_tx: mpsc::Sender<Vec<u8>>,
+    ) -> JoinHandle<()> {
+        let notifier_slot_for_task = notifier_slot;
+        let response_tx_for_task = response_tx;
+        tokio::spawn(async move {
             let mut reader_opt: Option<CharacteristicReader> = None;
             loop {
                 tokio::select! {
                     result = notifier_slot_for_task.wait_closed() => {
                         tracing::info!(target: "deunlock_transport", error = ?result.err(), "notification session closed; awaiting re-subscribe");
                     }
-                    // Phone subscribes / unsubscribes to challenge notifications.
                     chal_evt = notify_rx.recv() => {
                         match chal_evt {
                             Some(writer) => {
@@ -836,7 +819,6 @@ impl PersistentPeripheral {
                             }
                         }
                     }
-                    // Phone writes a response frame; accept and drain.
                     resp_evt = resp_control.next() => {
                         match resp_evt {
                             Some(CharacteristicControlEvent::Write(req)) => {
@@ -858,7 +840,6 @@ impl PersistentPeripheral {
                             }
                         }
                     }
-                    // Drain bytes from the response reader, if active.
                     read_res = async {
                         match &mut reader_opt {
                             Some(reader) => {
@@ -875,15 +856,194 @@ impl PersistentPeripheral {
                                 let _ = response_tx_for_task.send(bytes).await;
                             }
                             Ok(_) | Err(_) => {
-                                // Reader closed or errored; drop it, wait for next Write event.
                                 reader_opt = None;
                             }
                         }
                     }
                 }
             }
+        })
+    }
+
+    /// Register ONE application holding the pair service and every bonded peer's
+    /// session service, then (re)spawn all control loops against it.
+    ///
+    /// This is the only place a peer service may be registered. Registering a
+    /// peer-only application is how the pair service disappeared and how a second
+    /// phone would have knocked the first one off the air.
+    async fn rebuild_services(&self) -> Result<(), PeripheralError> {
+        // Abort every existing loop and snapshot the keys to rebuild from.
+        let keys: Vec<(String, BondKey)> = {
+            let peers = self.peers.lock().await;
+            let mut out = Vec::with_capacity(peers.len());
+            for (peer_id, set) in peers.iter() {
+                if let Some(handle) = set.task_handle.lock().await.take() {
+                    handle.abort();
+                }
+                out.push((peer_id.clone(), set.bond_key));
+            }
+            out
+        };
+
+        let mut pending: Vec<(String, PendingPeerService)> = Vec::with_capacity(keys.len());
+        for (peer_id, key) in keys {
+            pending.push((peer_id, self.build_peer_service(&key)));
+        }
+
+        let (pair_service, pair_control) = Self::build_pair_service(self.host_pubkey);
+        let peer_count = pending.len();
+        let mut services = Vec::with_capacity(1 + peer_count);
+        services.push(pair_service);
+        // `Service` is not `Clone`: move each tree into the application and keep
+        // only the control handles for the loops.
+        let mut carried: Vec<(String, PendingPeerService)> = Vec::with_capacity(peer_count);
+        for (peer_id, mut peer) in pending {
+            services.push(std::mem::take(&mut peer.service));
+            carried.push((peer_id, peer));
+        }
+
+        {
+            let mut slot = self.app_handle.lock().await;
+            *slot = None;
+        }
+        tracing::info!(
+            target: "deunlock_transport",
+            peers = peer_count,
+            "registering GATT app: pair service + one session service per peer"
+        );
+        let app = Application {
+            services,
+            ..Default::default()
+        };
+        let handle = self
+            .adapter
+            .serve_gatt_application(app)
+            .await
+            .map_err(|err| PeripheralError::Backend {
+                reason: format!("serve_gatt_application: {err}"),
+            })?;
+        {
+            let mut slot = self.app_handle.lock().await;
+            *slot = Some(handle);
+        }
+        tracing::info!(target: "deunlock_transport", "GATT app registration accepted by BlueZ");
+
+        // A phone with autoConnect keeps a link bound to the dead registration;
+        // dropping it makes the phone rediscover and re-subscribe.
+        if let Err(err) = self.kick_connected_peers().await {
+            tracing::warn!(
+                target: "deunlock_transport",
+                error = %err,
+                "kick_connected_peers failed; phones with stale subscriptions may need a manual BT cycle"
+            );
+        }
+
+        // Pair watcher against the fresh pair characteristic.
+        if let Some(prev) = self.pair_watcher.lock().await.take() {
+            prev.abort();
+        }
+        self.spawn_pair_watcher(pair_control).await;
+
+        // Per-peer loops, each stashed back into its PeerCharSet.
+        let mut peers = self.peers.lock().await;
+        for (peer_id, peer) in carried {
+            let PendingPeerService {
+                bond_key,
+                notify_rx,
+                resp_control,
+                notifier_slot,
+                response_tx,
+                response_rx,
+                ..
+            } = peer;
+            let task = Self::spawn_peer_loop(
+                notifier_slot.clone(),
+                notify_rx,
+                resp_control,
+                response_tx.clone(),
+            );
+            peers.insert(
+                peer_id,
+                PeerCharSet {
+                    bond_key,
+                    response_rx: Mutex::new(response_rx),
+                    _response_tx: response_tx,
+                    notifier_slot,
+                    task_handle: Mutex::new(Some(task)),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Spawn the pair watcher: every `CharacteristicControlEvent::Write` on the
+    /// phone-pubkey characteristic is a phone trying to commit a pair.
+    async fn spawn_pair_watcher(
+        &self,
+        mut pair_control: impl futures::Stream<Item = CharacteristicControlEvent> + Send + Unpin + 'static,
+    ) {
+        let pair_event_tx = self.pair_event_tx.clone();
+        let host_pubkey_for_watcher = self.host_pubkey;
+        let task = tokio::spawn(async move {
+            loop {
+                let evt = match pair_control.next().await {
+                    Some(e) => e,
+                    None => {
+                        tracing::info!(target: "deunlock_transport", "pair watcher: control stream closed");
+                        break;
+                    }
+                };
+                match evt {
+                    CharacteristicControlEvent::Write(req) => {
+                        let mut reader = match req.accept() {
+                            Ok(reader) => reader,
+                            Err(err) => {
+                                tracing::warn!(target: "deunlock_transport", error = %err, "pair watcher: accept failed");
+                                continue;
+                            }
+                        };
+                        // A pairing write is variable-length: the phone proves it
+                        // was given the operator's code (AUDIT-001 D-08). Read what
+                        // it sent, then let the decoder judge the shape.
+                        let mut buf = Vec::with_capacity(deunlock_core::PAIR_CODE_FRAME_LEN);
+                        match reader.read_to_end(&mut buf).await {
+                            Ok(_) => match deunlock_core::PairWrite::decode(&buf) {
+                                Ok(write) => {
+                                    tracing::info!(
+                                        target: "deunlock_transport",
+                                        bytes = buf.len(),
+                                        "pair watcher: pairing write received"
+                                    );
+                                    if let Err(err) = pair_event_tx
+                                        .send(PairEvent {
+                                            host_pubkey: host_pubkey_for_watcher,
+                                            write,
+                                        })
+                                        .await
+                                    {
+                                        tracing::warn!(target: "deunlock_transport", error = %err, "pair watcher: forward to event channel failed; daemon receiver gone");
+                                        break;
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        target: "deunlock_transport",
+                                        bytes = buf.len(),
+                                        error = %err,
+                                        "pair watcher: refused a pairing write"
+                                    );
+                                }
+                            },
+                            Err(err) => {
+                                tracing::warn!(target: "deunlock_transport", error = %err, "pair watcher: read failed");
+                            }
+                        }
+                    }
+                    CharacteristicControlEvent::Notify(_) => continue,
+                }
+            }
         });
-        Ok((notifier_slot, response_tx, response_rx, task))
+        *self.pair_watcher.lock().await = Some(task);
     }
 }
 
@@ -912,46 +1072,54 @@ impl Peripheral for PersistentPeripheral {
     }
 
     async fn add_peer(&self, peer_id: &str, bond_key: &BondKey) -> Result<(), PeripheralError> {
-        let peers = self.peers.lock().await;
-        if peers.contains_key(peer_id) {
-            return Err(PeripheralError::PeerAlreadyAdded {
-                peer_id: peer_id.to_owned(),
-            });
-        }
-        // Drop the existing peer-handle (if any) BEFORE serve_gatt_application
-        // — bluer rejects a second registration while the first is live.
-        drop(peers);
         {
-            let mut slot = self.app_handle.lock().await;
-            *slot = None;
+            let peers = self.peers.lock().await;
+            if peers.contains_key(peer_id) {
+                return Err(PeripheralError::PeerAlreadyAdded {
+                    peer_id: peer_id.to_owned(),
+                });
+            }
         }
-        let (notifier_slot, response_tx, response_rx, task) = self.build_and_register_peer(bond_key).await?;
-        let mut peers = self.peers.lock().await;
-        peers.insert(
-            peer_id.to_owned(),
-            PeerCharSet {
-                response_rx: Mutex::new(response_rx),
-                _response_tx: response_tx,
-                notifier_slot,
-                task_handle: Mutex::new(Some(task)),
-            },
-        );
+        // Register a placeholder, then rebuild so the pair service and every
+        // other peer's service stay registered alongside the new one.
+        {
+            let mut peers = self.peers.lock().await;
+            peers.insert(
+                peer_id.to_owned(),
+                PeerCharSet {
+                    bond_key: *bond_key,
+                    response_rx: Mutex::new(mpsc::channel::<Vec<u8>>(1).1),
+                    _response_tx: mpsc::channel::<Vec<u8>>(1).0,
+                    notifier_slot: Arc::new(NotificationChannel::default()),
+                    task_handle: Mutex::new(None),
+                },
+            );
+        }
+        self.rebuild_services().await?;
         Ok(())
     }
 
     async fn remove_peer(&self, peer_id: &str) -> Result<(), PeripheralError> {
-        let mut peers = self.peers.lock().await;
-        let Some(entry) = peers.remove(peer_id) else {
+        let removed = {
+            let mut peers = self.peers.lock().await;
+            match peers.remove(peer_id) {
+                Some(entry) => {
+                    if let Some(handle) = entry.task_handle.lock().await.take() {
+                        handle.abort();
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
+        if !removed {
             return Err(PeripheralError::UnknownPeer {
                 peer_id: peer_id.to_owned(),
             });
-        };
-        if let Some(handle) = entry.task_handle.lock().await.take() {
-            handle.abort();
         }
-        // Drop application registration; daemon will rebuild on next add.
-        let mut slot = self.app_handle.lock().await;
-        *slot = None;
+        // Re-register without this peer: the pair service must survive a revoke,
+        // otherwise the desktop advertises a pair mode it cannot serve.
+        self.rebuild_services().await?;
         Ok(())
     }
 

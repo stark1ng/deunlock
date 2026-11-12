@@ -351,7 +351,17 @@ public class RealPairBackend(
     private var pickedName: String = ""
 
     /** Resolved by the bond-state receiver. */
-    private val lescResultDeferred: CompletableDeferred<LescResult> = CompletableDeferred()
+    /**
+     * Result of the CURRENT pairing attempt.
+     *
+     * Replaced on every attempt: a Completed deferred is terminal, and the old
+     * single instance meant the second try in one app session returned the first
+     * try's failure no matter what the phone did (AUDIT-001 D-19).
+     */
+    @Volatile
+    private var lescResultDeferred: CompletableDeferred<LescResult> = CompletableDeferred()
+
+    /** One-shot guard per attempt, reset by [beginAttempt]. */
     private val exchangeStarted = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** Pairing-request receiver registered at init. */
@@ -476,6 +486,7 @@ public class RealPairBackend(
         // bond times out with HCI_ERR_AUTH_FAILURE.
         // Our compile SDK does not expose `createBond(int)`, so
         // use reflection to select LE. The transport constant is public.
+        beginAttempt()
         val bondState = runCatching { device.bondState }.getOrElse { -1 }
         Log.i(
             REAL_PAIR_BACKEND_LOG_TAG,
@@ -511,6 +522,45 @@ public class RealPairBackend(
 
     override fun awaitLescResult(): LescResult =
         runBlocking { lescResultDeferred.await() }
+
+    /**
+     * Arm a fresh attempt.
+     *
+     * A retry is a new pairing, not a continuation: the previous result must not
+     * answer for it, and the one-shot exchange guard must be open again.
+     */
+    /**
+     * Log a fingerprint per tag input, so a refused proof can be diagnosed by
+     * diffing this against the desktop's line instead of guessing which of the
+     * four inputs went stale (AUDIT-001 D-21).
+     */
+    private fun recordPairInputs(
+        code: String,
+        hostPubkey: ByteArray,
+        phonePubkey: ByteArray,
+        bond: ByteArray,
+    ) {
+        fun fp(bytes: ByteArray): String =
+            java.security.MessageDigest.getInstance("SHA-256")
+                .digest(bytes)
+                .take(4)
+                .joinToString("") { "%02x".format(it) }
+
+        val normalised = code.uppercase().filter { it.isLetterOrDigit() }
+        Log.i(
+            REAL_PAIR_BACKEND_LOG_TAG,
+            "pair proof inputs: code_len=${normalised.length} " +
+                "host_fp=${fp(hostPubkey)} phone_fp=${fp(phonePubkey)} " +
+                "bond_fp=${fp(bond)}",
+        )
+    }
+
+    internal fun beginAttempt() {
+        if (lescResultDeferred.isCompleted) {
+            lescResultDeferred = CompletableDeferred()
+        }
+        exchangeStarted.set(false)
+    }
 
     /**
      * Tear down the receivers and any active scan. Called by the
@@ -625,16 +675,21 @@ public class RealPairBackend(
         // never become the long-lived key.
         val freshBond = ByteArray(PAIR_BOND_KEY_LEN).also { java.security.SecureRandom().nextBytes(it) }
         val pairingCode = pairingCodeValue
-        if (pairingCode.length != PAIRING_CODE_LEN) {
+        // Count only what carries information: the desktop prints the code in two
+        // groups ("Y2JB0 DPN37") and Rust normalises case and I/L/O before hashing,
+        // so an honest transcription must not be rejected over a space (D-08).
+        val codeChars = pairingCode.count { it.isLetterOrDigit() }
+        if (codeChars == 0) {
             // Say it plainly: the operator skipped the code, and no amount of
             // GATT traffic will make the desktop accept this phone (D-08).
-            val reason = "pairing code missing: run deunlock pair-code on the computer and type it here"
+            val reason = "pairing code missing: run `deunlock pair-code` on the computer and type it here"
             Log.w(REAL_PAIR_BACKEND_LOG_TAG, reason)
             lescResultDeferred.complete(LescResult.Failed(reason))
             return
         }
         val hostPubkey = runCatching {
             exchange.exchangeCodePairing(address) { hostPubkey ->
+                recordPairInputs(pairingCode, hostPubkey, phonePubkey, freshBond)
                 pairWriteBuilder.build(pairingCode, hostPubkey, phonePubkey, freshBond)
             }
         }.getOrElse {
@@ -666,9 +721,6 @@ public class RealPairBackend(
     private companion object {
         /** Number of digits in the LESC numeric-comparison code. */
         const val LESC_CODE_DIGITS: Int = 6
-
-        /** Characters in a code printed by `deunlock pair-code`. */
-        const val PAIRING_CODE_LEN: Int = 10
     }
 }
 

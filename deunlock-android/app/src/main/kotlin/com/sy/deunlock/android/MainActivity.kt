@@ -1152,9 +1152,15 @@ private object PairingViewModelFactoryHolder {
                 val vm = PairingViewModel(
                     backend = backend,
                     oobCalculator = UniffiOobCalculator(),
-                    bondPersister = DiskBondPersister(
-                        bondStore = BondStore(context.filesDir),
-                    ),
+                    // Pairing must leave this phone able to answer: start the
+                    // companion service the moment the bond hits disk. Without
+                    // this the service waits for a boot / 15-minute watchdog /
+                    // CDM proximity trigger, and the first unlock after pairing
+                    // fails with "not connected" (AUDIT-001 D-20).
+                    bondPersister = com.sy.deunlock.android.pair.api.BondPersister { record ->
+                        DiskBondPersister(bondStore = BondStore(context.filesDir)).persist(record)
+                        com.sy.deunlock.android.bg.resurrectIfDead(context)
+                    },
                     bondRemover = ReflectionBondRemover(adapter = adapter),
                     companionAssociator = associator,
                 )

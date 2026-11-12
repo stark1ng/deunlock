@@ -122,10 +122,15 @@ private class RecordingReceiverRegistrar : ReceiverRegistrar {
 
 /** Returns a canned 32-byte host pubkey; used by the DEV-002 runtime error-path tests. */
 private class CannedHostPubkeyExchange : PairGattExchange {
+    private val callCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+    fun calls(): Int = callCount.get()
+
     override fun exchangeCodePairing(
         address: String,
         buildWrite: (hostPubkey: ByteArray) -> ByteArray,
     ): ByteArray {
+        callCount.incrementAndGet()
         val host = ByteArray(PAIR_PUBKEY_LEN) { (it + 0x40).toByte() }
         buildWrite(host)
         return host
@@ -173,6 +178,23 @@ private class RecordingPairWriteBuilder : PairWriteBuilder {
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
 class RealPairBackendRuntimeTest {
+    @Test
+    fun a_second_attempt_is_not_swallowed_by_the_first() {
+        // The retry guard used to be a one-shot for the lifetime of the backend and
+        // the result deferred was created once, so a failed first try answered every
+        // later one — the user typed a fresh code and nothing happened (D-19).
+        val exchange = CannedHostPubkeyExchange()
+        val backend = makeBackend(null, exchange, keystoreKeyGenerator = FixedKeystoreKeyGenerator())
+        backend.supplyPairingCode("7QK2M9XPDB")
+        backend.runPostBondExchange(FIXTURE_PEER_ADDR)
+        assertTrue("first attempt", backend.awaitLescResult() is LescResult.Bonded)
+
+        backend.beginAttempt()
+        backend.runPostBondExchange(FIXTURE_PEER_ADDR)
+        assertTrue("second attempt must run again", backend.awaitLescResult() is LescResult.Bonded)
+        assertEquals("both attempts reached the wire", 2, exchange.calls())
+    }
+
     @Test fun duplicate_bond_callbacks_exchange_keys_once() {
         var exchanges = 0
         val exchange = object : PairGattExchange {

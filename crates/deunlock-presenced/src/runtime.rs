@@ -744,6 +744,16 @@ fn warn_no_orchestrator(reason: &str) {
 /// failure its attempt counter is incremented, so a ten-character code cannot be
 /// ground down by a script that reconnects. Five wrong codes kill the offer
 /// outright.
+/// Short fingerprint of a byte string for cross-device log comparison.
+///
+/// Truncated to 32 bits on purpose: enough to tell "the phone read a stale host
+/// pubkey" from "the code differs" in a log diff, useless as a key.
+fn fp(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(bytes);
+    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn verify_pair_code(
     offer_path: &std::path::Path,
     host_pubkey: &[u8; 32],
@@ -768,6 +778,19 @@ fn verify_pair_code(
         .ok_or_else(|| "offer carries no code (this is a QR offer)".to_owned())?;
     let expected = deunlock_core::pair_code_tag(&code, host_pubkey, phone_pubkey, &write.bond)
         .map_err(|err| format!("cannot derive the expected tag: {err}"))?;
+    // A refused proof is undiagnosable from the phone's side alone: the tag covers
+    // code, host pubkey, phone pubkey and bond, and any one of them being stale
+    // looks identical. Fingerprints (public values, 32-bit truncation) say which.
+    tracing::info!(
+        target: "deunlock_presenced",
+        host_fp = %fp(host_pubkey),
+        phone_fp = %fp(phone_pubkey),
+        bond_fp = %fp(&write.bond),
+        tag_fp = %fp(&write.tag),
+        expected_fp = %fp(&expected),
+        code_len = code.len(),
+        "pair: verifying the phone's proof"
+    );
     if !deunlock_core::tags_equal(&expected, &write.tag) {
         let mut spent = offer.clone();
         spent.attempts = spent.attempts.saturating_add(1);

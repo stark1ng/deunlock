@@ -105,6 +105,18 @@ public class UniffiPairSessionUuidLookup : PairSessionUuidLookup {
  * pumped via `awaitLescResult` -> `runBlocking`, so the blocking is
  * intentional and bounded by [PAIR_GATT_EXCHANGE_TIMEOUT_SECS].
  */
+/**
+ * Reflective `BluetoothGatt.refresh()`.
+ *
+ * `@hide` on AOSP but stable since Android 4.x; it clears the per-device GATT
+ * service cache stored under `/data/misc/bluetooth/`. Best effort — a failed
+ * refresh only leaves the stale cache in place.
+ */
+private fun refreshGattCache(gatt: BluetoothGatt): Boolean = runCatching {
+    val method = gatt.javaClass.getMethod("refresh")
+    (method.invoke(gatt) as? Boolean) ?: false
+}.getOrElse { false }
+
 public class AndroidPairGattExchange(
     private val context: Context,
     private val adapter: BluetoothAdapter,
@@ -124,6 +136,12 @@ public class AndroidPairGattExchange(
         val callback = object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 if (newState == BluetoothGatt.STATE_CONNECTED) {
+                    // The desktop re-registers its GATT application on every peer
+                    // change and at every daemon start, which mints new attribute
+                    // handles while Android keeps the per-device service cache.
+                    // Without this refresh the phone talks to dead handles: the
+                    // write "succeeds" and nothing arrives (AUDIT-001 D-22).
+                    refreshGattCache(gatt)
                     runCatching { gatt.discoverServices() }
                 } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
                     if (hostPubkey.get() == null && failure.get() == null) {

@@ -25,6 +25,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+sha2 = "0.11"
 # Typed errors with `Display` impls; same pin as the rest of the workspace.
 thiserror = "2"
 # `anyhow` for the binary entrypoint's `Result<()>` plumbing, matching

@@ -716,3 +716,65 @@ Still open on this front: a phone that has never been told the code can connect 
 *write* — it just cannot produce a valid tag, so the desktop refuses it. That is
 the intended shape, but it means the pair characteristic is a free attack surface
 for garbage writes; a rate limit per BLE address is not implemented.
+
+### D-18 (high) — the pair service vanished after the first pairing, CLOSED
+
+`build_and_register_peer` registered a GATT application containing **only** the
+session service of the peer being added; bluer's `Application` is a snapshot, so
+every `add_peer` replaced the running registration. `remove_peer` dropped the
+registration outright.
+
+Consequences: the pair service existed only until the first phone paired, and a
+desktop that had just been revoked advertised a pair-mode UUID with no service
+behind it — the phone reported `pair service not present on bonded device`. A
+second phone was impossible for the same reason.
+
+Fix: one application holds the pair service plus one session service per bonded
+peer, rebuilt from the stored bond keys whenever the peer set changes
+(`rebuild_services`). Side effect: a second phone no longer evicts the first.
+
+### D-19 (medium) — a second pairing attempt in one app session did nothing, CLOSED
+
+`exchangeStarted` was a one-shot for the lifetime of the backend and
+`lescResultDeferred` was created once. After a failed attempt the guard rejected
+every later exchange silently, and `awaitLescResult` would have returned the first
+attempt's result forever. The user retyped a code and nothing happened, with no
+log line to explain it.
+
+Fix: `beginAttempt()` re-arms the guard and installs a fresh deferred at the start
+of every `pickPeer`; a Kotlin test asserts two attempts both reach the wire.
+
+### D-20 (medium) — pairing left the phone unable to answer, CLOSED
+
+The companion service starts on boot, on a 15-minute watchdog tick, or on CDM
+proximity — never on pairing. The first unlock after pairing therefore failed with
+`notification unavailable ... not connected`, while the phone looked correctly
+paired. Fix: the persister starts the service as soon as the bond is on disk.
+
+### D-21 (medium) — a refused proof was undiagnosable, CLOSED
+
+The tag covers code, host pubkey, phone pubkey and bond; any stale input produces
+the same `wrong pairing code`. Both sides now log 32-bit SHA-256 fingerprints of
+each input, so a refusal is diagnosed by diffing two log lines instead of guessing.
+Measured on the first live pairing: matching fingerprints, `code_len=10`.
+
+### D-22 (medium) — the phone talked to dead GATT handles, CLOSED
+
+The desktop mints new attribute handles every time it re-registers its
+application; Android caches the service table per bonded device. The pairing
+exchange discovered services without `refresh()`, so a write could report success
+and arrive nowhere (measured: phone logged `post-bond exchange complete`, desktop
+logged nothing). Fix: reflective `BluetoothGatt.refresh()` before discovery.
+
+Second half: a persistent client that discovered services a moment before the
+desktop registered the peer's session service logged `challenge characteristic not
+present` and stopped retrying, leaving the phone connected and useless. It now
+re-discovers after two seconds.
+
+Verified live: `deunlock pair-code` → phone types the code → `pair: code proved` →
+`phone subscribed via standard notifications` → `pamtester` → `successfully
+authenticated`, desktop `outcome=ok`.
+
+Still open: a desktop that already has one bond does not advertise the pair UUID
+(31-byte legacy advertisement budget), so a second phone cannot be added without
+revoking the first.

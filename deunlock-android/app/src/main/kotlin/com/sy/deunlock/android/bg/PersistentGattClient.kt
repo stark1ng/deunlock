@@ -354,7 +354,13 @@ public class PersistentGattClient internal constructor(
             Log.i(PERSISTENT_GATT_LOG_TAG, "services discovered status=$status n=${g.services.size}")
             val challenge = findCharacteristic(g, DEUNLOCK_CHALLENGE_CHAR_UUID)
             if (challenge == null) {
-                Log.w(PERSISTENT_GATT_LOG_TAG, "challenge characteristic not present")
+                // The desktop registers a peer's session service only after it has
+                // persisted the bond, and re-registers on every peer change. A phone
+                // that discovered services a moment too early would otherwise sit
+                // connected-and-useless forever (AUDIT-001 D-22).
+                Log.w(PERSISTENT_GATT_LOG_TAG, "challenge characteristic not present; retrying discovery")
+                reconnectHandler.removeCallbacks(reconnectRunnable)
+                reconnectHandler.postDelayed(reconnectRunnable, SERVICE_SETTLE_RETRY_MS)
                 return
             }
             val cccd = challenge.getDescriptor(CCCD_UUID)
@@ -439,6 +445,14 @@ public class PersistentGattClient internal constructor(
          * non-zero radio cost).
          */
         internal const val RECONNECT_INTERVAL_MS: Long = 15_000L
+
+        /**
+         * Wait before re-discovering when the session service is not there yet.
+         * Shorter than the watchdog interval: the desktop registers it within a
+         * second of persisting the bond, so a two-second retry lands promptly
+         * without hammering the controller.
+         */
+        internal const val SERVICE_SETTLE_RETRY_MS: Long = 2_000L
 
         /**
          * The `autoConnect` flag the production code always passes
