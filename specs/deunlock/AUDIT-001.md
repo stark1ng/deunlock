@@ -1075,3 +1075,25 @@ The underlying cause — the phone showing a prompt for a challenge the desktop
 abandoned — is still D-27's open half: withdrawing it needs a desktop→phone frame
 and a phone-side handler. This fix makes the desktop honest about it in the
 meantime: a withdrawn prompt's answer is discarded instead of denying the live one.
+
+### D-29 (unknown severity, OPEN) — two panics with no message to diagnose them
+
+Two PAM invocations between the W-1 install and the lock-screen wiring returned
+through the panic boundary:
+
+```
+Nov 12 12:11:19 pam_deunlock[…]: deunlock: unlock unavailable reason=panic
+Nov 12 12:14:42 pam_deunlock[…]: deunlock: unlock unavailable reason=panic
+```
+
+Fail-closed (`PAM_AUTH_ERR`, and with `sufficient` the stack continued to
+`pam_unix`), so nobody was locked out and nothing was bypassed. It has not
+recurred: every later invocation — `sudo`, `pamtester`, the lock screen — logged
+a normal verdict, and the same commands run by hand do not reproduce it.
+
+What is missing is the *reason*: `run_entry` logs that a panic happened and
+throws the payload away, and the panic message went to a stderr that is not in
+the journal. Next step is to log the payload (`catch_unwind` returns
+`&str`/`String` for a `panic!` and there is no reason to discard it), which is a
+one-line change to the panic boundary; until it reproduces with that in place,
+the honest state is "two fail-closed panics, cause unknown".
