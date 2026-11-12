@@ -1122,3 +1122,19 @@ prompt counts down from 30 s (`DEFAULT_TIMEOUT_MILLIS` in `ApproveViewModel`), s
 the desktop no longer gives up while the prompt is still on the screen. A typist
 pays nothing — typing wins immediately — and the window is still clipped by
 `timeout=` (27 s for `sudo`) and overridable per service with `choice=<ms>`.
+
+### W-1 — the choice, end to end on the live `sudo`
+
+Installed module `e4f6c925…` (byte-identical to `target/release/libpam_deunlock.so`),
+`/etc/pam.d/sudo` unchanged apart from the line that was already there:
+
+```
+12:44:33 pam_deunlock[…]: deunlock: unlock success reason=granted
+         peer_id=14f3a566465f2d29c16564ef2be12fd9 tty=/dev/pts/2
+12:48:00 pam_deunlock[…]: deunlock: unlock success reason=granted
+         peer_id=14f3a566465f2d29c16564ef2be12fd9 tty=/dev/pts/3
+```
+
+Two `sudo` invocations, two phone approvals, no password typed. The window is
+25,000 ms (D-30), the daemon abandons a cancelled challenge (D-27) and ignores a
+late answer to one (D-28).

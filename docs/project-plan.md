@@ -20,9 +20,10 @@ The loop works on a real machine, not a stand:
 | PAM module in the real `sudo` | works | `sudo mkdir -p /opt/…` → `drwxr-xr-x root root`, 4.4 s, audit `success` |
 | Bilateral revoke (D-14) | works | `outcome=bond-revoked`, `peers_after=0` |
 | Phone noticing a forgotten bond (D-26/D-26b) | works | `session service absent after 3 discoveries … parked`, resumes after re-pair |
-| Rust suite | 649 tests, clippy `-D warnings` clean | `cargo test --workspace -j 3`, `/tmp/f19.log` |
+| Rust suite | 654 tests, clippy `-D warnings` clean | `cargo test --workspace -j 3`, `/tmp/f25.log` |
 | Android unit tests + APK | green, installs over Wi-Fi | `testDebugUnitTest assembleDebug` |
-| The terminal offers a choice (W-1) | works live | `Confirm on your phone, or type your password:` then `Authentication failure` and no second prompt; `pam caller hung up mid-challenge` |
+| The terminal offers a choice (W-1) | works live | `Confirm on your phone, or type your password:` then `Authentication failure` and no second prompt; `pam caller hung up mid-challenge`; and the phone path end to end: `unlock success reason=granted peer_id=14f3a566… tty=/dev/pts/3` |
+| The lock screen (W-2) | works live | `unlock success reason=granted peer_id=14f3a566… tty=:0` — the phone unlocks Cinnamon, no prompt in the background |
 
 Not wired yet: every PAM surface except `sudo`. On this machine `lightdm`,
 `lightdm-greeter`, `lightdm-autologin` and `login` exist; `polkit-1` does not
@@ -189,7 +190,7 @@ independent; W-4 before W-5 because the tray's bond list is only interesting onc
 there is more than one bond; W-6 anywhere after W-2.
 
 Each package's gate: `cargo test --workspace -j 3` and
-`cargo clippy --workspace --all-targets -j 3 -- -D warnings` green (currently 649
+`cargo clippy --workspace --all-targets -j 3 -- -D warnings` green (currently 654
 tests); Kotlin `testDebugUnitTest` green when Android code moved; a live log line
 or a rendered frame for whatever the package claims; AUDIT-001 updated with what
 was measured; one commit, pushed.
