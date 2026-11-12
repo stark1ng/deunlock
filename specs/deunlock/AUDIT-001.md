@@ -973,3 +973,27 @@ Suite: `cargo test --workspace -j 3` → 649 passed, 0 failed, 11 ignored;
 `redundant_closure` warnings in `runtime.rs` / `pair_code.rs` / `pair_qr.rs`
 surfaced under the current clippy and were fixed in passing — no behaviour
 change.
+
+Live, on the installed stack (2026-11-12 12:03, module rebuilt from this tree,
+`deunlock-presenced` restarted on the same build):
+
+```
+$ ( sleep 1; echo <deliberately wrong> ) | script -qec "pamtester sudo roma authenticate" /dev/null
+Confirm on your phone, or type your password:
+pamtester: Authentication failure
+```
+
+One line, no second `Password:` prompt, and the password was deliberately wrong.
+That triple is the whole claim: `pam_unix` read the token out of `PAM_AUTHTOK`
+(it never asked again), the module did not authenticate anything itself
+(`PAM_IGNORE`, not `PAM_SUCCESS`), and nothing was echoed. The daemon, in the
+same second:
+
+```
+12:03:51 INFO notify_challenge: writing frame peer_id=14f3a566… bytes=105
+12:03:52 INFO pam caller hung up mid-challenge; challenge abandoned
+```
+
+`tests/pam_choice_e2e.rs` asserts those three properties and passes in 3.39 s
+(1 s of typing plus pam_unix's failure delay) against the installed module; run
+it with `DEUNLOCK_E2E=1`.

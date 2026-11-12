@@ -22,7 +22,7 @@ The loop works on a real machine, not a stand:
 | Phone noticing a forgotten bond (D-26/D-26b) | works | `session service absent after 3 discoveries … parked`, resumes after re-pair |
 | Rust suite | 649 tests, clippy `-D warnings` clean | `cargo test --workspace -j 3`, `/tmp/f19.log` |
 | Android unit tests + APK | green, installs over Wi-Fi | `testDebugUnitTest assembleDebug` |
-| The terminal offers a choice (W-1) | works in tests | `tests/choice_pty.rs` 5/5; `an_abandoned_challenge_frees_the_peer_slot` |
+| The terminal offers a choice (W-1) | works live | `Confirm on your phone, or type your password:` then `Authentication failure` and no second prompt; `pam caller hung up mid-challenge` |
 
 Not wired yet: every PAM surface except `sudo`. On this machine `lightdm`,
 `lightdm-greeter`, `lightdm-autologin` and `login` exist; `polkit-1` does not
