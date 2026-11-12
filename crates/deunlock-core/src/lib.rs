@@ -69,7 +69,10 @@ pub use qr_pairing::{
     derive_qr_bond_key, encode_pair_accept, encode_pair_request, verify_pair_accept,
     verify_pair_request,
 };
-pub use qr_pair::{DEFAULT_PAIRING_OFFER_PATH, MAX_HOST_BYTES, PAIRING_SECRET_BYTES, PairingOffer, PendingOffer, QrError, QR_PREFIX, QR_VERSION};
+pub use qr_pair::{
+    DEFAULT_PAIRING_OFFER_PATH, MAX_HOST_BYTES, PAIRING_SECRET_BYTES, PairingOffer, PendingOffer, QrError, QR_PREFIX, QR_VERSION,
+    default_pairing_offer_path,
+};
 pub use secrets::{
     BackendKind, InMemoryKeyStore, KEYRING_ID_PREFIX, KeyStore, LOG_LINE_KERNEL, LOG_LINE_SECRET_SERVICE, SECRET_SERVICE_ATTR_ID,
     SECRET_SERVICE_ATTR_KIND, SECRET_SERVICE_ATTR_KIND_VALUE, SECRET_SERVICE_COLLECTION, SECRET_SERVICE_CONTENT_TYPE, SecretError, detect,

@@ -52,6 +52,10 @@ pub const XDG_RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
 /// `<DEFAULT_RUNTIME_FALLBACK_PREFIX><uid>/deunlock/auth.sock`.
 pub const DEFAULT_RUNTIME_FALLBACK_PREFIX: &str = "/run/user/";
 
+/// State directory under the account's home, as created by
+/// `scripts/install-user-service.sh`.
+pub const USER_STATE_SUBDIR: &str = ".local/share/deunlock";
+
 /// Subdirectory under the runtime dir that holds the daemon's socket.
 /// Matches `deunlock_presenced::RUNTIME_SUBDIR`.
 pub const RUNTIME_SUBDIR: &str = "deunlock";
@@ -140,6 +144,65 @@ impl Config {
             auth_timeout,
             test_fixed_nonce: None,
         }
+    }
+
+    /// Build a `Config` for a real PAM invocation.
+    ///
+    /// Identical to [`Config::from_pam_argv`] except that the socket is resolved
+    /// against the **PAM account's** runtime directory instead of this process's
+    /// euid. PAM runs inside `sudo`, i.e. as root: resolving by euid lands on
+    /// `/run/user/0/deunlock/auth.sock`, where no daemon listens, so the phone is
+    /// never asked and every `sudo` silently falls through to the password
+    /// prompt. The account's own runtime dir is the only correct target.
+    #[must_use]
+    pub fn for_pam_invocation(argv: &[&str], pam_user: Option<&str>) -> Self {
+        let mut cfg = Self::from_pam_argv(argv);
+        let has_override = argv.iter().any(|arg| arg.starts_with(PAM_SOCKET_ARG_PREFIX));
+        if !has_override {
+            cfg.socket_path = Self::resolve_socket_path_for_user(pam_user);
+        }
+        // Same reasoning for the state directory: the audit line PAM appends
+        // must land in the user's own per-user install, not in a root-owned
+        // /var/lib path it would have to create as root.
+        if let Some(dir) = pam_user.and_then(Self::state_dir_for_user) {
+            cfg.bond_dir = dir;
+        }
+        cfg
+    }
+
+    /// Socket path inside a specific account's runtime directory.
+    ///
+    /// Returns `None` when the name does not resolve to a local account, so the
+    /// caller can fall back to the environment.
+    #[must_use]
+    pub fn runtime_socket_for_user(pam_user: &str) -> Option<PathBuf> {
+        let account = nix::unistd::User::from_name(pam_user).ok().flatten()?;
+        Some(
+            PathBuf::from(DEFAULT_RUNTIME_FALLBACK_PREFIX.to_string() + &account.uid.as_raw().to_string())
+                .join(RUNTIME_SUBDIR)
+                .join(DEFAULT_SOCKET_BASENAME),
+        )
+    }
+
+    /// Per-user state directory, when the account has one installed.
+    ///
+    /// Returns `None` for an account with no `~/.local/share/deunlock`, so a
+    /// system-wide install keeps using `DEFAULT_BOND_DIR`.
+    #[must_use]
+    pub fn state_dir_for_user(pam_user: &str) -> Option<PathBuf> {
+        let account = nix::unistd::User::from_name(pam_user).ok().flatten()?;
+        let dir = account.dir.join(USER_STATE_SUBDIR);
+        dir.is_dir().then_some(dir)
+    }
+
+    /// Resolve the socket for `pam_user`, falling back to the environment when
+    /// the account is unknown (a PAM stack can run before NSS is ready).
+    #[must_use]
+    pub fn resolve_socket_path_for_user(pam_user: Option<&str>) -> PathBuf {
+        if let Some(path) = pam_user.and_then(Self::runtime_socket_for_user) {
+            return path;
+        }
+        Self::resolve_socket_path(None)
     }
 
     /// Resolve the daemon's Unix-socket path. Precedence:
@@ -232,6 +295,34 @@ mod tests {
     use super::*;
 
     /// TC-12: the PAM module's argv parser picks up `socket=<path>`.
+    #[test]
+    fn a_pam_invocation_resolves_the_accounts_runtime_dir_not_the_processes() {
+        // Under `sudo` this process is root. Resolving by euid asks
+        // /run/user/0/deunlock/auth.sock, where nothing listens, and every
+        // privileged prompt falls through to the password (D-23).
+        let me = nix::unistd::User::from_uid(nix::unistd::geteuid())
+            .expect("passwd lookup")
+            .expect("current account");
+        let cfg = Config::for_pam_invocation(&[], Some(me.name.as_str()));
+
+        let expected = PathBuf::from(format!("/run/user/{}", me.uid.as_raw()))
+            .join(RUNTIME_SUBDIR)
+            .join(DEFAULT_SOCKET_BASENAME);
+        assert_eq!(cfg.socket_path, expected);
+    }
+
+    #[test]
+    fn an_explicit_socket_argument_still_wins() {
+        let cfg = Config::for_pam_invocation(&["socket=/tmp/elsewhere.sock"], Some("root"));
+        assert_eq!(cfg.socket_path, PathBuf::from("/tmp/elsewhere.sock"));
+    }
+
+    #[test]
+    fn an_unknown_account_falls_back_to_the_environment() {
+        let cfg = Config::for_pam_invocation(&[], Some("no-such-account-here"));
+        assert!(cfg.socket_path.ends_with(Path::new(RUNTIME_SUBDIR).join(DEFAULT_SOCKET_BASENAME)));
+    }
+
     #[test]
     fn pam_sm_authenticate_parses_socket_argument() {
         let argv = ["socket=/tmp/x.sock"];

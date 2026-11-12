@@ -28,7 +28,7 @@
 //! that secret is only as private as the screen showing the QR. That is the
 //! point: it is trusted because it was seen, not because it was sent.
 
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::{os::unix::fs::OpenOptionsExt as _, path::PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -44,6 +44,19 @@ pub const PAIRING_SECRET_BYTES: usize = 32;
 
 /// Where `deunlock pair-qr` leaves the offer for the daemon to find.
 pub const DEFAULT_PAIRING_OFFER_PATH: &str = "/run/deunlock/pairing.offer";
+
+/// Where the CLI writes the offer and the daemon looks for it.
+///
+/// `/run/deunlock` is root-owned, so a per-user install cannot write there; the
+/// user's own runtime directory is the only place both processes can reach
+/// (AUDIT-001 D-25). `DEUNLOCK_PAIRING_OFFER` still overrides everything.
+#[must_use]
+pub fn default_pairing_offer_path() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
+        Some(dir) => PathBuf::from(dir).join("deunlock").join("pairing.offer"),
+        None => PathBuf::from(DEFAULT_PAIRING_OFFER_PATH),
+    }
+}
 
 /// Maximum length of the LAN host name a QR may carry.
 pub const MAX_HOST_BYTES: usize = 63;

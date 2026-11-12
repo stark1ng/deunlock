@@ -221,7 +221,6 @@ pub unsafe extern "C" fn pam_sm_authenticate(pamh: *mut c_void, _flags: c_int, a
         // total even on hostile callers.
         let argv_strings = unsafe { collect_pam_argv(argc, argv) };
         let argv_refs: Vec<&str> = argv_strings.iter().map(String::as_str).collect();
-        let cfg = Config::from_pam_argv(&argv_refs);
         // SAFETY: `pamh` is the live handle libpam passed us; both helpers
         // tolerate a null handle by returning `None`.
         let (service, user) = unsafe {
@@ -230,6 +229,9 @@ pub unsafe extern "C" fn pam_sm_authenticate(pamh: *mut c_void, _flags: c_int, a
                 pam_string_item(pamh, PAM_ITEM_USER),
             )
         };
+        // The socket belongs to the account being authenticated, not to the
+        // process PAM happens to run in: under `sudo` that process is root.
+        let cfg = Config::for_pam_invocation(&argv_refs, user.as_deref());
         let ctx = auth::PamContext {
             service: service.unwrap_or_else(|| "unknown".to_string()),
             user: user.unwrap_or_else(|| "unknown".to_string()),

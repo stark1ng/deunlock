@@ -31,11 +31,13 @@ pub const BACKUP_SUFFIX: &str = ".bak";
 /// module search path; we deliberately do NOT hard-code an absolute path).
 pub const DEFAULT_SO_NAME: &str = "pam_deunlock.so";
 
-/// Default PAM module arguments inserted after the so-name. Matches
-/// the daemon's `DEFAULT_AUTH_TIMEOUT` (8 s) so a real BiometricPrompt
-/// reaction has headroom before the PAM round-trip falls through to
-/// the next sufficient module.
-pub const DEFAULT_MODULE_ARGS: &str = "timeout=8000";
+/// Default PAM module arguments inserted after the so-name.
+///
+/// Must sit **above** the daemon's own 25 s challenge deadline, otherwise PAM
+/// gives up on a human still reaching for the sensor and falls through to the
+/// password prompt — the phone is asked, then punished for being slow
+/// (AUDIT-001 D-23). 27 s leaves 2 s of transport headroom.
+pub const DEFAULT_MODULE_ARGS: &str = "timeout=27000";
 
 /// Default PAM control flag for the inserted auth directive.
 ///
@@ -111,7 +113,7 @@ pub struct InstallOpts {
     pub pam_dir: PathBuf,
 
     /// Module arguments appended after the so-name. Defaults to
-    /// `timeout=1200`.
+    /// `timeout=27000`, which must stay above the daemon's 25 s deadline.
     #[arg(long, default_value = DEFAULT_MODULE_ARGS)]
     pub module_args: String,
 
@@ -419,6 +421,22 @@ fn u2f_recognition_regex() -> &'static Regex {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_default_module_timeout_outlives_the_daemon_deadline() {
+        // The daemon waits 25 s for a fingerprint. A PAM timeout below that
+        // punishes the human for being slow and falls through to the password
+        // prompt after the phone was already asked (D-23).
+        let daemon_budget_ms: u64 = 25_000;
+        let timeout = DEFAULT_MODULE_ARGS
+            .strip_prefix("timeout=")
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .expect("timeout=<ms> in the default module args");
+        assert!(
+            timeout > daemon_budget_ms,
+            "PAM gives up at {timeout} ms while the daemon still waits {daemon_budget_ms} ms"
+        );
+    }
+
     const SAMPLE: &str = "#%PAM-1.0\nauth       include      system-auth\naccount    include      system-auth\n";
 
     fn opts_for(pam_dir: &Path) -> InstallOpts {
@@ -481,7 +499,7 @@ mod tests {
     fn build_line_uses_documented_defaults() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let line = build_line(&opts_for(dir.path()));
-        assert_eq!(line, "auth    sufficient    pam_deunlock.so timeout=8000");
+        assert_eq!(line, format!("auth    sufficient    pam_deunlock.so {DEFAULT_MODULE_ARGS}"));
     }
 
     #[test]
@@ -490,7 +508,7 @@ mod tests {
         let mut opts = opts_for(dir.path());
         opts.control = "required".to_string();
         let line = build_line(&opts);
-        assert_eq!(line, "auth    required    pam_deunlock.so timeout=8000");
+        assert_eq!(line, format!("auth    required    pam_deunlock.so {DEFAULT_MODULE_ARGS}"));
     }
 
     /// Roadmap `deunlock-integration` step 3 contract: an explicit

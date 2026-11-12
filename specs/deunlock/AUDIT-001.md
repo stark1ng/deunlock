@@ -778,3 +778,48 @@ authenticated`, desktop `outcome=ok`.
 Still open: a desktop that already has one bond does not advertise the pair UUID
 (31-byte legacy advertisement budget), so a second phone cannot be added without
 revoking the first.
+
+### D-23 (high) — the PAM module looked for a socket root does not own, CLOSED
+
+`Config::resolve_socket_path` resolved `${XDG_RUNTIME_DIR}` or `/run/user/<euid>`.
+PAM inside `sudo` runs as root, so euid is 0 and both paths point at a directory
+with no daemon: the phone was never asked and every privileged prompt fell
+straight through to the password, looking like "it does nothing".
+
+Fix: `Config::for_pam_invocation` resolves the socket from the **PAM account's**
+uid via passwd lookup, keeps an explicit `socket=` override, and falls back to
+the environment only when the account is unknown.
+
+Same defect in the audit line: PAM appended to `DEFAULT_BOND_DIR`
+(`/var/lib/deunlock`, root-owned). It now uses the account's own
+`~/.local/share/deunlock` when that exists.
+
+### D-23b (high) — `install-pam` wired a timeout below the daemon's deadline
+
+`DEFAULT_MODULE_ARGS` was `timeout=8000` while the daemon waits 25 s for a
+fingerprint: PAM asked the phone, gave up after 8 s and prompted for the
+password anyway. Now `timeout=27000`, with a test asserting the constant stays
+above the daemon's budget.
+
+### D-24 (medium) — a per-user install had no identity and could not pair
+
+The daemon only *loaded* `/etc/deunlock/host.key`, so a user-service install
+issued v1 challenges and `deunlock pair-code` refused to mint a code at all.
+Both now use `load_or_create`: the first start mints the identity, `pair-code`
+does too.
+
+### D-25 (medium) — the pairing offer lived in a root-only directory
+
+`DEFAULT_PAIRING_OFFER_PATH` was `/run/deunlock/pairing.offer`, which a
+user-service daemon cannot write or read. It now resolves to
+`$XDG_RUNTIME_DIR/deunlock/pairing.offer`, with the old path kept as the
+fallback when the runtime directory is unset.
+
+### Product install
+
+`scripts/install-user-service.sh` (no sudo) builds release binaries into
+`~/.local/libexec/deunlock`, creates `~/.local/share/deunlock` at 0700, writes
+`~/.config/systemd/user/deunlock-presenced.service` with `Restart=on-failure`
+and per-user paths, and restarts the unit. `scripts/install-pam-system.sh`
+(sudo) installs `pam_deunlock.so` and inserts the `sufficient` line into a PAM
+service, backing the file up first.

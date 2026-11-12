@@ -28,10 +28,10 @@ session    optional     pam_xauth.so
 ";
 
 /// Canonical inserted line under the current CLI defaults
-/// (`--control sufficient`, `--module-args timeout=8000`). Tests
+/// (`--control sufficient`, `--module-args timeout=27000`). Tests
 /// that want the legacy `required` / `timeout=1200` shape pass the
 /// flags explicitly.
-const CANONICAL_LINE: &str = "auth    sufficient    pam_deunlock.so timeout=8000";
+const CANONICAL_LINE: &str = "auth    sufficient    pam_deunlock.so timeout=27000";
 
 /// Service name used by every test.
 const SERVICE_NAME: &str = "sudo";
@@ -286,7 +286,7 @@ fn tc09_install_honors_so_path() {
 
     let after = fs::read_to_string(&service).expect("read after");
     assert!(
-        after.contains("auth    sufficient    pam_deunlock_test.so timeout=8000"),
+        after.contains("auth    sufficient    pam_deunlock_test.so timeout=27000"),
         "expected custom so-path to be honored; got:\n{after}"
     );
 }

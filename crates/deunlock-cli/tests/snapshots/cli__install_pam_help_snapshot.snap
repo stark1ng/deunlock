@@ -1,6 +1,5 @@
 ---
 source: crates/deunlock-cli/tests/cli.rs
-assertion_line: 132
 expression: "help_stdout(&[\"install-pam\", \"--help\"])"
 ---
 Wire `pam_deunlock.so` into a PAM service file, atomically and with a `.bak` snapshot of the original
@@ -13,7 +12,7 @@ Options:
       --pam-dir <PAM_DIR>
           PAM service directory to modify. Defaults to `/etc/pam.d`. Tests inject a tempdir [default: /etc/pam.d]
       --module-args <MODULE_ARGS>
-          Module arguments appended after the so-name. Defaults to `timeout=1200` [default: timeout=8000]
+          Module arguments appended after the so-name. Defaults to `timeout=27000`, which must stay above the daemon's 25 s deadline [default: timeout=27000]
       --so-path <SO_PATH>
           Shared-object name of the PAM module. Defaults to `pam_deunlock.so`. PAM resolves this against its module search path [default: pam_deunlock.so]
       --yes

@@ -46,7 +46,7 @@ pub struct PairCodeOpts {
 #[must_use]
 pub fn default_offer_path() -> PathBuf {
     std::env::var_os("DEUNLOCK_PAIRING_OFFER").map_or_else(
-        || PathBuf::from(deunlock_core::DEFAULT_PAIRING_OFFER_PATH),
+        || deunlock_core::default_pairing_offer_path(),
         PathBuf::from,
     )
 }
@@ -88,9 +88,9 @@ pub fn mint_code(offer_path: &Path, now: u64, ttl: u64) -> Result<String> {
         || PathBuf::from(deunlock_core::DEFAULT_HOST_KEY_PATH),
         PathBuf::from,
     );
-    let identity = deunlock_core::HostIdentity::load(&host_key_path).with_context(|| {
+    let identity = deunlock_core::HostIdentity::load_or_create(&host_key_path).with_context(|| {
         format!(
-            "host identity missing at {} (run `deunlock pair --host-key`)",
+            "cannot create a host identity at {}",
             host_key_path.display()
         )
     })?;

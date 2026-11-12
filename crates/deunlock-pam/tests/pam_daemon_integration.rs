@@ -100,6 +100,11 @@ impl DaemonProcess {
     fn spawn(args: Vec<String>) -> Self {
         let child = Command::new(daemon_binary_path())
             .args(args)
+            // The canned signature below covers a v1 transcript. An inherited
+            // host key would switch the daemon to v2 and the test would fail on
+            // a machine where an identity happens to exist — the test must own
+            // its own transcript version.
+            .env_remove("DEUNLOCK_HOST_KEY")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

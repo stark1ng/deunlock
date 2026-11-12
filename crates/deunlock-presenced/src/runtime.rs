@@ -224,8 +224,14 @@ pub async fn run(config: Config) -> Result<ShutdownReason, RunError> {
     // and non-standard installs point elsewhere.
     let host_key_path = std::env::var_os("DEUNLOCK_HOST_KEY")
         .map_or_else(|| std::path::PathBuf::from(deunlock_core::DEFAULT_HOST_KEY_PATH), std::path::PathBuf::from);
-    let host_id = match deunlock_core::HostIdentity::load(&host_key_path) {
-        Ok(identity) => Some(identity.host_id()),
+    // A per-user install has no `/etc/deunlock` to pre-provision, so the daemon
+    // mints the identity on first start. Without it every challenge is v1 and the
+    // phone cannot prove a code-bound pairing (AUDIT-001 D-24).
+    let host_id = match deunlock_core::HostIdentity::load_or_create(&host_key_path) {
+        Ok(identity) => {
+            tracing::info!(path = %host_key_path.display(), host_id = %hex::encode(identity.host_id()), "host identity ready");
+            Some(identity.host_id())
+        }
         Err(err) => {
             tracing::warn!(path = %host_key_path.display(), error = %err, "no host identity; issuing v1 challenges");
             None
@@ -426,7 +432,7 @@ async fn start_lan(config: &Config, host_id: Option<[u8; 32]>) -> Option<Arc<dyn
     // record is refused, so being armed costs nothing and means `deunlock pair-qr`
     // works without restarting the daemon.
     let offer_path = std::env::var_os("DEUNLOCK_PAIRING_OFFER").map_or_else(
-        || std::path::PathBuf::from(deunlock_core::DEFAULT_PAIRING_OFFER_PATH),
+        || deunlock_core::default_pairing_offer_path(),
         std::path::PathBuf::from,
     );
     let server = server.with_pairing(
@@ -611,7 +617,7 @@ async fn maybe_spawn_orchestrator(
         // Same hand-off file the QR path uses: `deunlock pair-code` writes it,
         // the daemon verifies codes against it and deletes it on success.
         let offer_path_for_pair = std::env::var_os("DEUNLOCK_PAIRING_OFFER").map_or_else(
-            || std::path::PathBuf::from(deunlock_core::DEFAULT_PAIRING_OFFER_PATH),
+            || deunlock_core::default_pairing_offer_path(),
             std::path::PathBuf::from,
         );
         // The pair write is tagged under (host_pubkey, phone_pubkey, bond), so
