@@ -161,6 +161,14 @@ fn formatter() -> Formatter3164 {
 /// that one observability path becomes silent in those environments — the
 /// e2e test documents the assumption.
 fn log_info(message: &str) {
+    // Unit tests exercise the panic boundary and the verdict lines on purpose.
+    // Writing those to the system journal makes a passing test look like a
+    // production incident — that is exactly how two "panics" in AUDIT-001 D-29
+    // turned out to be `cargo test` runs. The integration tests that *grep* the
+    // journal run the built `.so`, where `cfg!(test)` is false.
+    if cfg!(test) {
+        return;
+    }
     if let Ok(mut logger) = syslog::unix(formatter())
         && logger.info(message).is_err()
     {

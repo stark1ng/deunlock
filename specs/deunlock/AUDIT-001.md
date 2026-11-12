@@ -1076,25 +1076,46 @@ abandoned — is still D-27's open half: withdrawing it needs a desktop→phone 
 and a phone-side handler. This fix makes the desktop honest about it in the
 meantime: a withdrawn prompt's answer is discarded instead of denying the live one.
 
-### D-29 (unknown severity, OPEN) — two panics with no message to diagnose them
-
-Two PAM invocations between the W-1 install and the lock-screen wiring returned
-through the panic boundary:
+### D-29 (closed, not a defect) — the two "panics" were the test suite
 
 ```
 Nov 12 12:11:19 pam_deunlock[…]: deunlock: unlock unavailable reason=panic
 Nov 12 12:14:42 pam_deunlock[…]: deunlock: unlock unavailable reason=panic
+Nov 12 12:32:25 pam_deunlock[…]: deunlock: unlock unavailable reason=panic
+Nov 12 12:34:53 pam_deunlock[…]: deunlock: unlock unavailable reason=panic detail=simulated bug
 ```
 
-Fail-closed (`PAM_AUTH_ERR`, and with `sufficient` the stack continued to
-`pam_unix`), so nobody was locked out and nothing was bypassed. It has not
-recurred: every later invocation — `sudo`, `pamtester`, the lock screen — logged
-a normal verdict, and the same commands run by hand do not reproduce it.
+`entry.rs::run_entry_panic_boundary` panics with `simulated bug` on purpose, and
+`log_info` wrote that to the auth log from *every* `cargo test -p deunlock-pam`
+run: the timestamps match the test runs exactly, and the `detail=` field added
+while chasing it (`184d0e7`) names the message. No production invocation ever
+panicked.
 
-What was missing was the *reason*: `run_entry` logged that a panic happened and
-threw the payload away, and the panic message went to a stderr the journal never
-saw. That is fixed — the boundary now logs the payload, flattened to one token
-and bounded at 200 characters, so `reason=panic detail=…` names the `expect`
-that fired (`entry.rs::a_panic_message_is_kept_as_one_log_token`). Until it
-reproduces with that in place, the honest state is "two fail-closed panics,
-cause unknown".
+Two things changed anyway, because both made the confusion possible:
+
+* the panic boundary now logs the payload, so the next real panic names the
+  `expect` that fired (`entry.rs::a_panic_message_is_kept_as_one_log_token`);
+* `log_info` is silent under `cfg!(test)`, so a passing test run can no longer
+  look like a production incident. The integration tests that grep the journal
+  run the built `.so`, where `cfg!(test)` is false.
+
+### D-30 (low, CLOSED) — the 6 s window was shorter than picking up a phone
+
+The first `sudo` after the lock screen was wired, measured:
+
+```
+12:37:41.41 INFO notify_challenge: writing frame …      ← the phone rings
+12:37:47.41 INFO pam caller hung up mid-challenge      ← exactly 6.0 s later
+12:37:47    pam_deunlock: reason=choice-deadline tty=/dev/pts/2
+```
+
+Six seconds was the budget for a phone *already in hand* (~4 s measured), not
+for the real gesture: notification, pick the phone up, unlock it, touch the
+sensor. The window expired while the prompt was still on the phone, `sudo`
+printed its own password prompt, and the operator typed his password — after
+which the phone's approval arrived with nobody waiting (D-27's open half, now
+harmless thanks to D-28).
+
+`DEFAULT_CHOICE_WINDOW` is 12,000 ms. It costs a typist nothing — typing wins
+immediately — and it is still capped by `timeout=` and overridable per service
+with `choice=<ms>`.

@@ -61,9 +61,14 @@ pub const CHOICE_PROMPT: &str = "Confirm on your phone, or type your password: "
 /// Phone-side budget when the caller can type.
 ///
 /// Measured on the reference phone: ~4 s from the notification to the sensor
-/// answering. Six seconds leaves room for a slow first press without making a
-/// typist wait for a phone that is in another room.
-pub const DEFAULT_CHOICE_WINDOW: Duration = Duration::from_millis(6_000);
+/// answering when the phone is already in hand. Twelve seconds covers the real
+/// case — the notification arrives, the phone is picked up, unlocked and
+/// touched — and costs a typist nothing, because typing wins immediately.
+///
+/// Six seconds (the first value) was too tight: the very first `sudo` after
+/// wiring it expired the window at 6.0 s and fell through to a password prompt
+/// while the phone was still ringing (AUDIT-001 D-30).
+pub const DEFAULT_CHOICE_WINDOW: Duration = Duration::from_millis(12_000);
 
 /// Floor for an operator-supplied `choice=<ms>`.
 pub const MIN_CHOICE_WINDOW_MS: u64 = 1_000;
