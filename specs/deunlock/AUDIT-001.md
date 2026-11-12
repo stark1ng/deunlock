@@ -1170,3 +1170,44 @@ a_second_challenge_replaces_the_prompt … FAILED  (BUILD FAILED)
 The activity now renders from a `MutableState` and rebinds on `onNewIntent`,
 logging `re-render peer=… superseded=…`. The superseded challenge needs no
 answer: its caller has already abandoned it.
+
+### D-31 — the fix, measured on the device
+
+Installed `…/app-debug.apk` (built 13:10) over Wi-Fi. To make the overlap happen
+the first caller was killed after one second, so its challenge was abandoned
+while the prompt was still on the phone:
+
+```
+13:20:31.059 daemon  notify_challenge …                      (challenge I)
+13:20:32.056 daemon  pam caller hung up mid-challenge         (I abandoned)
+13:20:30.162 phone   render peer=04:EA:56… host=deunlock       (I on screen)
+13:20:33.043 phone   render peer=04:EA:56… host=deunlock       (J bound)
+13:20:33.043 phone   re-render peer=04:EA:56… superseded=04:EA:56…
+13:20:34.061 daemon  notify_challenge …                      (challenge J)
+```
+
+The second challenge no longer sits behind the first: the live instance rebinds
+and says so. (The phone's clock runs ~1 s behind the desktop's; the two lines at
+:33.043 are `bind()`'s own log followed by `onNewIntent`'s.)
+
+### D-32 (medium, OPEN) — rebinding while an approval is already in flight
+
+The same run exposed the next layer, and it is worth stating plainly because it
+is the operator-visible end of this sequence:
+
+```
+13:20:34.834 daemon  ignoring an answer to a challenge that is no longer open
+13:20:59.063 daemon  tx … outcome=response-timeout
+```
+
+The operator's tap landed on prompt I (the one he was looking at when he reached
+for the sensor); by the time the Keystore callback fired, the screen had rebound
+to J. The signature therefore answered I — correctly recognised as stale by D-28
+and ignored — and J timed out with nothing to show for the tap.
+
+So after D-31 the *screen* follows the newest challenge, but an approval that is
+already running does not: it commits to the frame it started with (which is the
+right security behaviour — one biometric, one challenge) and leaves the new one
+unanswered. The fix belongs on the phone: on rebind, if a biometric/approve flow
+is in flight, cancel it and present the new challenge fresh, instead of letting
+one tap be spent on a prompt that no longer exists.
