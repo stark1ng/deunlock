@@ -533,7 +533,47 @@ fn phone_off_touches_neither_the_daemon_nor_the_terminal() {
 }
 
 // =============================================================================
-// 5. the environment escape hatch behaves like the module argument
+// 5. a GUI stack has no keyboard to offer
+// =============================================================================
+
+#[test]
+fn a_gui_stack_gets_no_prompt_and_the_full_phone_budget() {
+    let _env = env_guard();
+    clear_disable_env();
+    let (_tmp, cfg) = config_with_one_bonded_peer();
+    // Short module budget keeps the test fast: with no terminal the phone gets
+    // the whole `timeout=`, which is the point of the assertion below.
+    let cfg = cfg.with_auth_timeout(Duration::from_millis(600));
+    let _daemon = MockDaemon::spawn(&cfg.socket_path, Mode::Silent);
+    let pty = pty();
+
+    let started = Instant::now();
+    // What a lock screen hands us: a service name, not a path — and a `choice=`
+    // that must NOT be used, because there is no keyboard to race.
+    let choice = choice::run(
+        &cfg,
+        &context(),
+        &["choice=2000"],
+        Some("cinnamon-screensaver"),
+    );
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(choice, Choice::Phone(_)),
+        "with no terminal the verdict must be the phone's; got {choice:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(500) && elapsed < Duration::from_millis(1_500),
+        "the phone must get the module budget, not the typing window; took {elapsed:?}"
+    );
+    assert!(
+        pty.output(Duration::from_millis(200)).is_empty(),
+        "a GUI stack must never be printed at — its keyboard is a window"
+    );
+}
+
+// =============================================================================
+// 6. the environment escape hatch behaves like the module argument
 // =============================================================================
 
 #[test]

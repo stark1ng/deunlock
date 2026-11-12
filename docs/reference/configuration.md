@@ -95,6 +95,16 @@ Whichever answers first wins. A password cancels the challenge (the socket is cl
 
 Without a terminal (`cron`, a pipe, an `sshd` session with no pty) nothing is printed and the phone keeps the full `timeout=` budget, as before.
 
+The module decides what "a terminal" means from `PAM_TTY`, because a GUI stack's keyboard is a window, not a tty:
+
+| `PAM_TTY` | Behaviour |
+| --- | --- |
+| an absolute path (`/dev/pts/3`) | the choice is offered on that terminal |
+| a bare name (`cinnamon-screensaver`) | no choice — the phone gets the full budget |
+| absent | `/dev/tty`, but only when the module's own process group owns that keyboard (`tcgetpgrp`), which is the case for `sudo`, `su`, `login` and `pamtester` |
+
+A lock screen inherits the X session's `/dev/tty` without owning its keyboard: printing a prompt there would be invisible and reading it would race the application that does own the keystrokes, so it is deliberately excluded.
+
 ### Results returned to PAM
 
 | Return code | When |

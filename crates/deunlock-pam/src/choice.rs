@@ -301,54 +301,76 @@ struct CallerTty {
 }
 
 impl CallerTty {
-    /// Open `pam_tty` (falling back to `/dev/tty`) and turn echo off.
+    /// Open the caller's terminal and turn echo off.
     ///
-    /// Returns `None` when there is no usable terminal: a pipe, `cron`, or an
-    /// `sshd` session without a pty. Also `None` when the terminal refuses
-    /// echo-off — half a password prompt is worse than none.
+    /// Which terminal, and whether we may use one at all:
+    ///
+    /// * `PAM_TTY` is an absolute path — that is the terminal the stack says it
+    ///   is talking to (`sudo` sets it, so does `login`/`su`/`pamtester`). Use it.
+    /// * `PAM_TTY` names something else — a GUI stack that invented a
+    ///   pseudo-terminal name, e.g. a lock screen. No choice: its keyboard is a
+    ///   window, not this tty.
+    /// * `PAM_TTY` is absent — fall back to `/dev/tty`, but only when **we are
+    ///   the foreground job** of that terminal. A GUI helper inherits the X
+    ///   session's `/dev/tty` without owning its keyboard; printing a prompt
+    ///   there would be invisible and reading it would race the application that
+    ///   does own the keystrokes.
+    ///
+    /// Returns `None` in all the other cases: a pipe, `cron`, an sshd session
+    /// without a pty, or a terminal that refuses echo-off. Half a password
+    /// prompt is worse than none.
     fn open(pam_tty: Option<&str>) -> Option<Self> {
-        let mut candidates: Vec<&str> = Vec::with_capacity(2);
-        if let Some(path) = pam_tty.filter(|p| p.starts_with('/')) {
-            candidates.push(path);
-        }
-        candidates.push("/dev/tty");
-
-        for path in candidates {
-            // `O_NOCTTY`: opening the terminal must never make it our
-            // controlling terminal.
-            let file = match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_NOCTTY)
-                .open(path)
-            {
-                Ok(file) => file,
-                Err(_) => continue,
-            };
-            let original = match tcgetattr(&file) {
-                Ok(termios) => termios,
-                // Not a terminal (a regular file, a socket): not tty.
-                Err(_) => continue,
-            };
-            let mut quiet = original.clone();
-            // Echo off exactly like a password prompt: ICANON stays on so the
-            // kernel does the line editing, ISIG stays on so Ctrl-C still
-            // interrupts, and ECHONL is off so the Enter key does not leak a
-            // newline we did not write.
-            quiet
-                .local_flags
-                .remove(LocalFlags::ECHO | LocalFlags::ECHOE | LocalFlags::ECHOK | LocalFlags::ECHONL);
-            if tcsetattr(&file, SetArg::TCSANOW, &quiet).is_err() {
-                continue;
+        match pam_tty {
+            // A path is the caller naming its own terminal; trust it and do not
+            // wander off to /dev/tty if it turns out not to be one.
+            Some(path) if path.starts_with('/') => Self::open_path(path),
+            // A bare name (or empty) is a stack that has no terminal to offer.
+            Some(_) => None,
+            None => {
+                let file = Self::open_path("/dev/tty")?;
+                // `/dev/tty` is only ours if our process group owns the
+                // keyboard: `tcgetpgrp` reports the foreground group.
+                let foreground = match nix::unistd::tcgetpgrp(file.as_fd()) {
+                    Ok(pgrp) if pgrp == nix::unistd::getpgrp() => true,
+                    // A tty with no session gets EIO; a tty owned by somebody
+                    // else gets their pgroup. Both mean "not ours".
+                    _ => false,
+                };
+                if foreground {
+                    Some(file)
+                } else {
+                    None
+                }
             }
-            return Some(Self {
-                file,
-                original,
-                prompt_open: false,
-                discard_input: true,
-            });
         }
-        None
+    }
+
+    /// Open `path` and turn echo off, or `None` when it is not a terminal.
+    fn open_path(path: &str) -> Option<Self> {
+        // `O_NOCTTY`: opening the terminal must never make it our controlling
+        // terminal.
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(path)
+            .ok()?;
+        let original = tcgetattr(&file).ok()?;
+        let mut quiet = original.clone();
+        // Echo off exactly like a password prompt: ICANON stays on so the
+        // kernel does the line editing, ISIG stays on so Ctrl-C still
+        // interrupts, and ECHONL is off so the Enter key does not leak a
+        // newline we did not write.
+        quiet
+            .local_flags
+            .remove(LocalFlags::ECHO | LocalFlags::ECHOE | LocalFlags::ECHOK | LocalFlags::ECHONL);
+        tcsetattr(&file, SetArg::TCSANOW, &quiet).ok()?;
+        Some(Self {
+            file,
+            original,
+            prompt_open: false,
+            discard_input: true,
+        })
     }
 
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
