@@ -823,3 +823,35 @@ fallback when the runtime directory is unset.
 and per-user paths, and restarts the unit. `scripts/install-pam-system.sh`
 (sudo) installs `pam_deunlock.so` and inserts the `sufficient` line into a PAM
 service, backing the file up first.
+
+### D-26 (medium, OPEN) — a phone cannot tell that the desktop forgot it
+
+Observed live: the desktop's state was reinstalled under a new identity, so its
+`bonds.toml` was empty while the phone still held a bond record from the previous
+install. The phone then did the only thing it knows — connect, discover, fail to
+find its session characteristic, reconnect:
+
+```
+deunlock.bg.persistent: services discovered status=0 n=4
+deunlock.bg.persistent: challenge characteristic not present; retrying discovery
+deunlock.bg.persistent: watchdog: setup incomplete after 15000ms — forcing reconnect
+```
+
+The pairing screen never appeared, so a fresh `pair-code` could not be used at
+all. Locally removing the bond record was not enough either: the *running*
+service re-persisted the in-memory bond after the file was deleted, so the app
+kept believing it was paired until the process was force-stopped first.
+
+Fix direction: after N consecutive discoveries without the session
+characteristic, mark the bond `unverified` (never delete the Keystore key), stop
+the reconnect loop, and show "this computer does not recognise this phone — pair
+again" with the pairing screen behind it. Also: a bond removal must invalidate
+the in-memory copy, not just the file.
+
+### Product loop verified end to end (2026-11-12)
+
+systemd user service (`deunlock-presenced.service`, `Restart=on-failure`) →
+`deunlock pair-code` → phone types the code → `pair: code proved` → phone
+subscribes → `pamtester sudo roma authenticate` → `successfully authenticated`
+(3.2 s, audit `success`) → plain `sudo true` → exit 0 in 12.2 s with a
+fingerprint on the phone and no password typed.
