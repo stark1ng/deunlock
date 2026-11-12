@@ -1190,7 +1190,7 @@ The second challenge no longer sits behind the first: the live instance rebinds
 and says so. (The phone's clock runs ~1 s behind the desktop's; the two lines at
 :33.043 are `bind()`'s own log followed by `onNewIntent`'s.)
 
-### D-32 (medium, OPEN) — rebinding while an approval is already in flight
+### D-32 (medium, CLOSED) — rebinding while an approval is already in flight
 
 The same run exposed the next layer, and it is worth stating plainly because it
 is the operator-visible end of this sequence:
@@ -1211,3 +1211,32 @@ right security behaviour — one biometric, one challenge) and leaves the new on
 unanswered. The fix belongs on the phone: on rebind, if a biometric/approve flow
 is in flight, cancel it and present the new challenge fresh, instead of letting
 one tap be spent on a prompt that no longer exists.
+
+The two rules that came out of it, both now in the code:
+
+* an approval signs the frame it started with — `onApproveClicked` captures the
+  challenge locally instead of reading `resolvedChallenge` from inside the
+  callback, so a rebind can no longer re-target a tap in flight;
+* the round is withdrawn on rebind — `BiometricGate.cancel()` closes the open
+  prompt, the approval generation is bumped, and a callback carrying an older
+  generation is dropped with `answer for a superseded challenge dropped`. Dropping
+  matters even for the failure path: a cancel surfaces as
+  `onAuthenticationError`, and writing that back would deny — or sign — a
+  challenge nobody asked about.
+
+Measured in `ChallengeApprovalActivityTest` (6 tests, 141 Android unit tests
+overall, 0 failures):
+
+```
+a_tap_that_is_overtaken_is_withdrawn_and_its_late_result_dropped … ok
+an_undisturbed_tap_still_answers … ok
+# with supersedeInFlightApproval disabled (the old behaviour):
+a_tap_that_is_overtaken_is_withdrawn_and_its_late_result_dropped … FAILED
+```
+
+Live, on the new APK, the sequence that used to waste a tap now ends clean: the
+first caller was killed at 1 s, the second challenge was notified 1 s later, one
+tap, `tx … outcome=ok` 3.7 s after the notify. The withdrawal line
+(`withdrew an in-flight approval for the superseded challenge`) only appears when
+the tap genuinely lands before the rebind, so it is covered by the test rather
+than by a lucky race.

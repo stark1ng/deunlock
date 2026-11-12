@@ -24,6 +24,7 @@ import androidx.test.core.app.ApplicationProvider
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -49,6 +50,47 @@ private class RecordingCancelSink : CancelSink {
         calls += peerId to deniedFrameBytes
     }
 }
+
+/** Gate that records the round without opening a real prompt, and can be cancelled. */
+private class RecordingGate(private val respondImmediately: Boolean = false) : BiometricGate {
+    var authenticateCount: Int = 0
+        private set
+    var cancelCount: Int = 0
+        private set
+    var lastChallenge: ByteArray = ByteArray(0)
+        private set
+    private var lastCallback: BiometricGateCallback? = null
+
+    override fun authenticate(
+        keystoreAlias: String,
+        challengeBytes: ByteArray,
+        callback: BiometricGateCallback,
+    ) {
+        authenticateCount += 1
+        lastChallenge = challengeBytes
+        lastCallback = callback
+        if (respondImmediately) {
+            callback.onSucceeded(ByteArray(SIGNATURE_LEN) { 1 })
+        }
+    }
+
+    override fun cancel() {
+        cancelCount += 1
+    }
+
+    fun succeedLate(signatureBytes: ByteArray) {
+        lastCallback?.onSucceeded(signatureBytes)
+    }
+}
+
+private class RecordingApprovalSink : ResponseSink {
+    val calls: MutableList<Pair<String, ByteArray>> = mutableListOf()
+    override fun onResponse(peerId: String, responseBytes: ByteArray) {
+        calls += peerId to responseBytes
+    }
+}
+
+private const val SIGNATURE_LEN: Int = 64
 
 private fun fixtureIntent(): Intent {
     val context = ApplicationProvider.getApplicationContext<android.content.Context>()
@@ -151,5 +193,67 @@ class ChallengeApprovalActivityTest {
             ByteArray(FIXTURE_CHALLENGE_LEN) { (it + SECOND_CHALLENGE_SEED).toByte() },
             activity.lastRenderedChallenge,
         )
+    }
+
+    /**
+     * D-32 — a tap that is overtaken must not be spent on the old challenge, and
+     * the late result must not be written back as if it answered the new one.
+     *
+     * Measured live before this test: the operator tapped the prompt that was on
+     * screen, the screen rebound to the next challenge while the Keystore was
+     * working, the signature answered the old frame (the desktop ignored it as
+     * stale, D-28) and the challenge actually open timed out — "I put my finger
+     * on it and nothing happened".
+     */
+    @Test
+    fun a_tap_that_is_overtaken_is_withdrawn_and_its_late_result_dropped() {
+        val gate = RecordingGate()
+        ChallengeApprovalActivity.biometricGate = gate
+        val sink = RecordingApprovalSink()
+        ChallengeApprovalActivity.responseSink = sink
+        val controller = Robolectric.buildActivity(
+            ChallengeApprovalActivity::class.java,
+            fixtureIntent(),
+        ).create().start().resume()
+        val activity = controller.get()
+
+        activity.onApproveClicked()
+        assertEquals("the tap opens one biometric round", 1, gate.authenticateCount)
+
+        controller.newIntent(secondChallengeIntent())
+
+        assertEquals("the round for the replaced challenge is withdrawn", 1, gate.cancelCount)
+        assertFalse("the screen stays up for the new challenge", activity.isFinishing)
+        assertEquals(SECOND_PEER_ID, activity.lastRenderedPeerId)
+
+        // The OS may deliver the withdrawn round's result anyway.
+        gate.succeedLate(ByteArray(SIGNATURE_LEN) { 9 })
+
+        assertTrue(
+            "a superseded answer must not be written back, not even as a denial",
+            sink.calls.isEmpty(),
+        )
+        assertFalse("and it must not dismiss the new challenge", activity.isFinishing)
+    }
+
+    /** The ordinary path still answers: no rebind, no withdrawal. */
+    @Test
+    fun an_undisturbed_tap_still_answers() {
+        val gate = RecordingGate()
+        ChallengeApprovalActivity.biometricGate = gate
+        val sink = RecordingApprovalSink()
+        ChallengeApprovalActivity.responseSink = sink
+        val controller = Robolectric.buildActivity(
+            ChallengeApprovalActivity::class.java,
+            fixtureIntent(),
+        ).create().start().resume()
+        val activity = controller.get()
+
+        activity.onApproveClicked()
+        gate.succeedLate(ByteArray(SIGNATURE_LEN) { 3 })
+
+        assertEquals(1, sink.calls.size)
+        assertEquals(FIXTURE_PEER_ID, sink.calls[0].first)
+        assertTrue("the activity finishes after answering", activity.isFinishing)
     }
 }

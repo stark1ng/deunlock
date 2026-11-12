@@ -252,6 +252,20 @@ public interface BiometricGate {
         challengeBytes: ByteArray,
         callback: BiometricGateCallback,
     )
+
+    /**
+     * Withdraw a prompt that is still open, if any.
+     *
+     * Called when the challenge it was opened for is superseded: a second
+     * challenge can arrive while the operator's finger is on the sensor
+     * (AUDIT-001 D-32), and the answer must be asked again for the frame that is
+     * actually open instead of being spent on the old one. Implementations MUST
+     * be safe to call when no prompt is open, and the callback of the withdrawn
+     * round must not be relied upon afterwards — the caller invalidates it.
+     */
+    public fun cancel() {
+        // No prompt to withdraw.
+    }
 }
 
 /**
@@ -331,6 +345,18 @@ public class ChallengeApprovalActivity : FragmentActivity() {
     private var resolvedChallenge: ByteArray = ByteArray(0)
     private var resolvedKeystoreAlias: String = ""
 
+    /** True while a biometric round is open for the challenge on screen. */
+    private var approvalInFlight: Boolean = false
+
+    /** Gate the open round runs on, so a rebind can withdraw it. */
+    private var activeGate: BiometricGate? = null
+
+    /**
+     * Bumped whenever the challenge on screen is replaced. A callback carrying an
+     * older value belongs to a challenge nobody is waiting for any more (D-32).
+     */
+    private var approvalGeneration: Int = 0
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
@@ -387,6 +413,8 @@ public class ChallengeApprovalActivity : FragmentActivity() {
         resolvedHostname = hostname
         resolvedChallenge = intent?.getByteArrayExtra(EXTRA_CHALLENGE_BYTES) ?: ByteArray(0)
         resolvedKeystoreAlias = intent?.getStringExtra(EXTRA_KEYSTORE_ALIAS).orEmpty()
+        // A tap already in progress belongs to the challenge being replaced.
+        supersedeInFlightApproval()
         val promptText = "$hostname is requesting sudo (peer_id ${shortPeerId(peerId)})"
         lastPromptText = promptText
         lastRenderedPeerId = peerId
@@ -410,33 +438,80 @@ public class ChallengeApprovalActivity : FragmentActivity() {
      * (per-use Keystore key contract per SPEC §3.2 D6).
      */
     internal fun onApproveClicked() {
-        Log.i(APPROVAL_LOG_TAG, "approve peer=$resolvedPeerId alias=$resolvedKeystoreAlias")
+        val peerId = resolvedPeerId
+        val alias = resolvedKeystoreAlias
+        // The challenge is captured here, not read again inside the callback: an
+        // approval answers the frame the operator was looking at when he tapped,
+        // and a rebind in between must not silently re-target it (D-32).
+        val challenge = resolvedChallenge
+        val generation = approvalGeneration
+        Log.i(APPROVAL_LOG_TAG, "approve peer=$peerId alias=$alias")
         // Test override on the companion seam takes precedence over
         // the per-instance production gate so a Robolectric JVM test
         // can drive succeed() / fail() without firing a real prompt.
         val gate = biometricGate ?: AndroidBiometricGate(
             activity = this,
-            peerId = resolvedPeerId,
+            peerId = peerId,
             hostname = resolvedHostname,
         )
+        activeGate = gate
+        approvalInFlight = true
         gate.authenticate(
-            resolvedKeystoreAlias,
-            resolvedChallenge,
+            alias,
+            challenge,
             object : BiometricGateCallback {
                 override fun onSucceeded(signatureBytes: ByteArray) {
-                    Log.i(APPROVAL_LOG_TAG, "approve sig ok peer=$resolvedPeerId len=${signatureBytes.size}")
+                    if (!isStillTheOpenChallenge(generation, peerId)) return
+                    Log.i(APPROVAL_LOG_TAG, "approve sig ok peer=$peerId len=${signatureBytes.size}")
                     writeResponseAndFinish(signatureBytes)
                 }
 
                 override fun onFailed(reason: String) {
-                    Log.i(APPROVAL_LOG_TAG, "approve fail peer=$resolvedPeerId reason=$reason")
+                    if (!isStillTheOpenChallenge(generation, peerId)) return
+                    Log.i(APPROVAL_LOG_TAG, "approve fail peer=$peerId reason=$reason")
                     writeResponseAndFinish(DENIED_FRAME_BYTES)
                 }
             },
         )
     }
 
+    /**
+     * Drop the result of an approval whose challenge is no longer on screen.
+     *
+     * The prompt is withdrawn on rebind, but the OS may already have queued a
+     * callback (a cancel arrives as `onAuthenticationError`). Writing that answer
+     * would deny — or, worse, sign — a challenge nobody asked about.
+     */
+    private fun isStillTheOpenChallenge(generation: Int, peerId: String): Boolean {
+        if (generation == approvalGeneration) {
+            return true
+        }
+        Log.i(APPROVAL_LOG_TAG, "answer for a superseded challenge dropped peer=$peerId")
+        return false
+    }
+
+    /**
+     * Withdraw an approval that is running for the challenge being replaced.
+     *
+     * One biometric round signs one challenge — that rule does not bend when a
+     * second challenge arrives mid-tap. The round is cancelled and the new
+     * challenge is asked for afresh, so the operator's finger is not spent on a
+     * prompt that no longer exists (AUDIT-001 D-32).
+     */
+    private fun supersedeInFlightApproval() {
+        if (!approvalInFlight) {
+            return
+        }
+        approvalInFlight = false
+        approvalGeneration += 1
+        activeGate?.cancel()
+        activeGate = null
+        Log.i(APPROVAL_LOG_TAG, "withdrew an in-flight approval for the superseded challenge")
+    }
+
     private fun writeResponseAndFinish(responseBytes: ByteArray) {
+        approvalInFlight = false
+        activeGate = null
         responseSink?.onResponse(resolvedPeerId, responseBytes)
         if (!isFinishing) {
             finish()
@@ -554,6 +629,16 @@ internal class AndroidBiometricGate(
     private val hostname: String,
 ) : BiometricGate {
 
+    /** The prompt currently open, so [cancel] has something to withdraw. */
+    private var prompt: BiometricPrompt? = null
+
+    override fun cancel() {
+        val open = prompt ?: return
+        prompt = null
+        Log.i(APPROVAL_LOG_TAG, "withdrawing the biometric prompt peer=$peerId")
+        runCatching { open.cancelAuthentication() }
+    }
+
     override fun authenticate(
         keystoreAlias: String,
         challengeBytes: ByteArray,
@@ -623,6 +708,7 @@ internal class AndroidBiometricGate(
         }
         val prompt = BiometricPrompt(activity, executor, authCallback)
         val promptInfo = buildPromptInfo(activity, hostname, shortPeerIdInternal(peerId))
+        this.prompt = prompt
         prompt.authenticate(promptInfo, BiometricPrompt.CryptoObject(signature))
     }
 
