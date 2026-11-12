@@ -1,5 +1,5 @@
-Script started on 2026-11-12 13:26:59+02:00 [COMMAND="pamtester sudo roma authenticate" <not executed on terminal>]
+Script started on 2026-11-12 13:34:40+02:00 [COMMAND="pamtester sudo roma authenticate" <not executed on terminal>]
 Confirm on your phone, or type your password: 
 pamtester: successfully authenticated
 
-Script done on 2026-11-12 13:27:03+02:00 [COMMAND_EXIT_CODE="0"]
+Script done on 2026-11-12 13:34:45+02:00 [COMMAND_EXIT_CODE="0"]

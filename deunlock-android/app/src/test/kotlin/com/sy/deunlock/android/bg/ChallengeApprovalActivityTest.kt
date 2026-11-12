@@ -236,9 +236,13 @@ class ChallengeApprovalActivityTest {
         assertFalse("and it must not dismiss the new challenge", activity.isFinishing)
     }
 
-    /** The ordinary path still answers: no rebind, no withdrawal. */
+    /**
+     * The ordinary path still answers: no rebind, no withdrawal — and the answer
+     * reaches the wire *before* the verdict is shown, so the desktop is not kept
+     * waiting for an animation.
+     */
     @Test
-    fun an_undisturbed_tap_still_answers() {
+    fun an_undisturbed_tap_answers_while_the_verdict_is_still_on_screen() {
         val gate = RecordingGate()
         ChallengeApprovalActivity.biometricGate = gate
         val sink = RecordingApprovalSink()
@@ -252,8 +256,30 @@ class ChallengeApprovalActivityTest {
         activity.onApproveClicked()
         gate.succeedLate(ByteArray(SIGNATURE_LEN) { 3 })
 
-        assertEquals(1, sink.calls.size)
+        assertEquals("the answer is written immediately", 1, sink.calls.size)
         assertEquals(FIXTURE_PEER_ID, sink.calls[0].first)
-        assertTrue("the activity finishes after answering", activity.isFinishing)
+        assertFalse(
+            "the screen stays up for the verdict, which is what shows ACCESS GRANTED",
+            activity.isFinishing,
+        )
+    }
+
+    /** With the dwell off (as tests run it), the activity closes on the answer. */
+    @Test
+    fun the_activity_closes_once_the_dwell_is_over() {
+        ChallengeApprovalActivity.dwellEnabled = false
+        val gate = RecordingGate()
+        ChallengeApprovalActivity.biometricGate = gate
+        ChallengeApprovalActivity.responseSink = RecordingApprovalSink()
+        val controller = Robolectric.buildActivity(
+            ChallengeApprovalActivity::class.java,
+            fixtureIntent(),
+        ).create().start().resume()
+        val activity = controller.get()
+
+        activity.onApproveClicked()
+        gate.succeedLate(ByteArray(SIGNATURE_LEN) { 3 })
+
+        assertTrue("the activity finishes after the dwell", activity.isFinishing)
     }
 }

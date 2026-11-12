@@ -1240,3 +1240,43 @@ tap, `tx … outcome=ok` 3.7 s after the notify. The withdrawal line
 (`withdrew an in-flight approval for the superseded challenge`) only appears when
 the tap genuinely lands before the rebind, so it is covered by the test rather
 than by a lucky race.
+
+## W-3 — the phone prompt, first pass
+
+The popup had no sense of time and no verdict: an expired challenge sat on the
+phone until somebody cleared it, and a successful approval vanished the instant
+the Keystore returned. Both are now state, not prose.
+
+* **A countdown that tells the truth.** The ring shows the *phone's* budget
+  (`APPROVAL_BUDGET_MILLIS`, 30 s), not the desktop's 25 s — the desktop's
+  deadline is not in the frame, and a countdown that guessed it would be wrong by
+  however much the two differ. What the ring promises is what happens: at zero the
+  prompt closes itself.
+* **Closing answers nothing.** The all-zero frame means "the owner denied this"
+  and is not signature-checked (D-03), so writing it on a timeout would deny
+  whatever challenge is open by then. The prompt just goes away; the desktop's own
+  deadline decides the authentication.
+* **A verdict worth reading.** `ACCESS GRANTED` / `DENIED` in monospace caps, the
+  denial reason in words ("you cancelled it", "the key is gone — pair this phone
+  again"), buttons gone because the question is answered. The answer still goes on
+  the wire *first* — the dwell is for the operator, the protocol never waits for
+  it.
+* **Colour with a rule.** Ring green, amber under ten seconds, red under three,
+  and a verdict overrides the countdown (`approvalTone`).
+* **Reduced motion.** With the system animation scale at 0 the ring stays whole
+  and only the numeral changes.
+* **Contrast, measured not asserted**: green `#22C55E` on black is 9.22:1, amber
+  9.78:1, red 5.58:1, dim grey 8.03:1 — all above WCAG AA for normal text.
+
+Measured: 151 Android unit tests, 0 failures (`ApprovalPresentationTest` covers the
+arithmetic, the tone thresholds and every raw sensor string). On the device:
+
+```
+13:33:53 deunlock.bg.approve: render peer=04:EA:56… host=deunlock
+13:33:53 Displayed …ChallengeApprovalActivity … +189ms
+13:33:59 approve sig ok peer=04:EA:56… len=64
+```
+
+and the rendered prompt is `assets/screenshots/approve-prompt.png`: ring at 28 of
+30, `WAITING FOR YOU`, `deunlock is requesting sudo (peer_id C2:0E:51)`, Approve /
+Cancel.

@@ -24,6 +24,7 @@ The loop works on a real machine, not a stand:
 | Android unit tests + APK | green, installs over Wi-Fi | `testDebugUnitTest assembleDebug` |
 | The terminal offers a choice (W-1) | works live | `Confirm on your phone, or type your password:` then `Authentication failure` and no second prompt; `pam caller hung up mid-challenge`; and the phone path end to end: `unlock success reason=granted peer_id=14f3a566… tty=/dev/pts/3` |
 | The lock screen (W-2) | works live | `unlock success reason=granted peer_id=14f3a566… tty=:0` — the phone unlocks Cinnamon, no prompt in the background |
+| The phone prompt (W-3, first pass) | works live | countdown ring at 28/30, `WAITING FOR YOU`, `ACCESS GRANTED` / `DENIED` with words, reduced motion honoured; `assets/screenshots/approve-prompt.png` |
 
 Not wired yet: every PAM surface except `sudo`. On this machine `lightdm`,
 `lightdm-greeter`, `lightdm-autologin` and `login` exist; `polkit-1` does not

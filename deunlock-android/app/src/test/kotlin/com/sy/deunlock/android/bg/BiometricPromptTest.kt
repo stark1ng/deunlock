@@ -164,6 +164,9 @@ class BiometricPromptTest {
 
     @Test
     fun cancel_writes_denied() {
+        // The verdict dwell is a UI courtesy; this test asserts the wire answer
+        // and the close, so it turns the dwell off.
+        ChallengeApprovalActivity.dwellEnabled = false
         val gate = RecordingBiometricGate()
         val sink = RecordingResponseSink()
         ChallengeApprovalActivity.biometricGate = gate

@@ -65,6 +65,9 @@ import android.util.Log
 import androidx.activity.compose.setContent
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -73,12 +76,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -92,6 +92,27 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTag
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.em
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.lifecycleScope
+import com.sy.deunlock.android.ui.theme.SyBorder
+import com.sy.deunlock.android.ui.theme.SyDanger
+import com.sy.deunlock.android.ui.theme.SySuccess
+import com.sy.deunlock.android.ui.theme.SyTextDim
+import com.sy.deunlock.android.ui.theme.SyWarning
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import com.sy.deunlock.android.R
@@ -333,12 +354,11 @@ public class ChallengeApprovalActivity : FragmentActivity() {
     internal var lastRenderedChallenge: ByteArray = ByteArray(0)
         private set
 
-    /**
-     * Prompt text the Compose tree renders. A `MutableState` because the same
-     * instance can be re-bound: the activity is `singleInstance`, so a second
-     * challenge arrives through [onNewIntent], not [onCreate] (D-31).
-     */
-    private val renderedPrompt = mutableStateOf("")
+    /** Everything the prompt draws; the composable is a pure function of it. */
+    private val screen = mutableStateOf(ApprovalScreenState(promptText = ""))
+
+    /** Countdown job for the challenge on screen. */
+    private var tickerJob: Job? = null
 
     private var resolvedPeerId: String = ""
     private var resolvedHostname: String = ""
@@ -367,7 +387,8 @@ public class ChallengeApprovalActivity : FragmentActivity() {
         }
         setContent {
             ApprovalContent(
-                promptText = renderedPrompt.value,
+                state = screen.value,
+                reduceMotion = reduceMotion(),
                 onApprove = ::onApproveClicked,
                 onCancel = ::onCancelClicked,
             )
@@ -419,15 +440,89 @@ public class ChallengeApprovalActivity : FragmentActivity() {
         lastPromptText = promptText
         lastRenderedPeerId = peerId
         lastRenderedChallenge = resolvedChallenge
-        renderedPrompt.value = promptText
+        stopCountdown()
+        screen.value = ApprovalScreenState(promptText = promptText)
+        startCountdown()
         Log.i(APPROVAL_LOG_TAG, "render peer=$peerId host=$hostname")
         return true
+    }
+
+    /**
+     * Start the phone-side countdown for the challenge now on screen.
+     *
+     * It is the phone's own budget, not the desktop's: the desktop's deadline is
+     * not in the frame, and a countdown that guessed it would be lying by however
+     * much the two differ. What this clock promises is exactly what happens — the
+     * prompt closes when it reaches zero, and answers nothing.
+     */
+    private fun startCountdown() {
+        tickerJob = lifecycleScope.launch {
+            while (true) {
+                delay(APPROVAL_TICK_MILLIS)
+                val current = screen.value
+                if (!current.isOpen) {
+                    return@launch
+                }
+                val next = current.afterTick()
+                screen.value = next
+                if (next.hasRunOut) {
+                    onPromptExpired()
+                    return@launch
+                }
+            }
+        }
+    }
+
+    private fun stopCountdown() {
+        tickerJob?.cancel()
+        tickerJob = null
+    }
+
+    /**
+     * The prompt ran out of time.
+     *
+     * Answers *nothing*: the all-zero frame means "the owner denied this" and is
+     * not signature-checked (AUDIT-001 D-03), so writing it late would deny
+     * whatever challenge is open by then. Closing the screen is the honest move —
+     * the desktop's own deadline decides the authentication.
+     */
+    private fun onPromptExpired() {
+        Log.i(APPROVAL_LOG_TAG, "prompt expired unanswered peer=$resolvedPeerId")
+        approvalInFlight = false
+        activeGate?.cancel()
+        activeGate = null
+        screen.value = screen.value.withOutcome(ApprovalOutcome.Denied("it expired — run the command again"))
+        finishAfterDwell(DENIED_DWELL_MILLIS)
+    }
+
+    /** Finish after the verdict has been readable for [millis]. */
+    private fun finishAfterDwell(millis: Long) {
+        if (!dwellEnabled) {
+            if (!isFinishing) finish()
+            return
+        }
+        lifecycleScope.launch {
+            delay(millis)
+            if (!isFinishing) finish()
+        }
+    }
+
+    /** True when the system asks for reduced motion. */
+    private fun reduceMotion(): Boolean {
+        val scale = android.provider.Settings.Global.getFloat(
+            contentResolver,
+            android.provider.Settings.Global.ANIMATOR_DURATION_SCALE,
+            1f,
+        )
+        return scale == 0f
     }
 
     /** Test seam: invoked by the Compose Cancel button. */
     internal fun onCancelClicked() {
         Log.i(APPROVAL_LOG_TAG, "cancel peer=$resolvedPeerId reason=$DENIED_FRAME_REASON")
+        stopCountdown()
         cancelSink?.onCancel(resolvedPeerId, DENIED_FRAME_BYTES)
+        screen.value = screen.value.withOutcome(ApprovalOutcome.Denied("you cancelled it"))
         finish()
     }
 
@@ -463,13 +558,17 @@ public class ChallengeApprovalActivity : FragmentActivity() {
                 override fun onSucceeded(signatureBytes: ByteArray) {
                     if (!isStillTheOpenChallenge(generation, peerId)) return
                     Log.i(APPROVAL_LOG_TAG, "approve sig ok peer=$peerId len=${signatureBytes.size}")
-                    writeResponseAndFinish(signatureBytes)
+                    answerAndAnnounce(ApprovalOutcome.Granted, signatureBytes, GRANTED_DWELL_MILLIS)
                 }
 
                 override fun onFailed(reason: String) {
                     if (!isStillTheOpenChallenge(generation, peerId)) return
                     Log.i(APPROVAL_LOG_TAG, "approve fail peer=$peerId reason=$reason")
-                    writeResponseAndFinish(DENIED_FRAME_BYTES)
+                    answerAndAnnounce(
+                        ApprovalOutcome.Denied(plainDenialReason(reason)),
+                        DENIED_FRAME_BYTES,
+                        DENIED_DWELL_MILLIS,
+                    )
                 }
             },
         )
@@ -519,6 +618,22 @@ public class ChallengeApprovalActivity : FragmentActivity() {
     }
 
     /**
+     * Answer the challenge, then show the verdict for [dwellMillis] before closing.
+     *
+     * The answer goes first on purpose: the desktop is holding a password prompt
+     * open, and the confirmation on the phone is for the operator, not for the
+     * unlock. Nothing about the protocol waits for the animation.
+     */
+    private fun answerAndAnnounce(outcome: ApprovalOutcome, responseBytes: ByteArray, dwellMillis: Long) {
+        approvalInFlight = false
+        activeGate = null
+        stopCountdown()
+        responseSink?.onResponse(resolvedPeerId, responseBytes)
+        screen.value = screen.value.withOutcome(outcome)
+        finishAfterDwell(dwellMillis)
+    }
+
+    /**
      * Test helper exposing the constructed
      * `BiometricPrompt.PromptInfo` so the DoD assertion
      * `BiometricPromptTest::strong_authenticator_required` can pin
@@ -560,10 +675,20 @@ public class ChallengeApprovalActivity : FragmentActivity() {
         public var biometricGate: BiometricGate? = null
 
         /** Reset all seams to `null`. Used by Robolectric tests. */
+        /**
+         * Whether a verdict is left on screen for its dwell before the activity
+         * closes. Production: yes. Robolectric: the tests set this to `false`, so
+         * "the activity finished" stays a synchronous assertion instead of a race
+         * against a coroutine the JVM scheduler runs on its own clock.
+         */
+        @Volatile
+        public var dwellEnabled: Boolean = true
+
         public fun resetSeams() {
             cancelSink = null
             responseSink = null
             biometricGate = null
+            dwellEnabled = true
         }
     }
 }
@@ -740,8 +865,14 @@ private val APPROVAL_SECTION_SPACING_DP = 16.dp
 /** Vertical gap between the Approve and Cancel buttons. */
 private val APPROVAL_BUTTON_SPACING_DP = 12.dp
 
-/** Lock-icon diameter at the top of the screen. */
-private val APPROVAL_ICON_SIZE_DP = 72.dp
+/** Diameter of the countdown ring. Big enough to read from an arm's length. */
+private val APPROVAL_RING_SIZE_DP = 200.dp
+
+/** Ring stroke. Thick enough to see the arc shrink without looking for it. */
+private val APPROVAL_RING_STROKE_DP = 10.dp
+
+/** Seconds numeral inside the ring. */
+private val APPROVAL_RING_NUMERAL_SP = 56.sp
 
 /** Primary-button height; matches prrr-android's Connect button (56.dp). */
 private val APPROVAL_BUTTON_HEIGHT_DP = 56.dp
@@ -749,9 +880,38 @@ private val APPROVAL_BUTTON_HEIGHT_DP = 56.dp
 /** Horizontal inset around the full-width Approve / Cancel buttons. */
 private val APPROVAL_BUTTON_HORIZONTAL_PADDING_DP = 24.dp
 
+/** Letter spacing on the terminal-style headline, so the caps read as a token. */
+private const val APPROVAL_HEADLINE_TRACKING_EM: Float = 0.12f
+
+/** Ring colour for a tone. Green is the app's accent, amber warns, red is the last chance. */
+@Composable
+private fun ringColour(state: ApprovalScreenState): Color = when (approvalTone(state)) {
+    ApprovalTone.Calm -> SySuccess
+    ApprovalTone.Warning -> SyWarning
+    ApprovalTone.Urgent -> SyDanger
+    ApprovalTone.Verdict -> if (state.outcome is ApprovalOutcome.Denied) SyDanger else SySuccess
+}
+
+/**
+ * The prompt the operator sees over the keyguard.
+ *
+ * A countdown ring around the remaining seconds — the one number that matters
+ * when the desktop is waiting — then the headline, the sentence naming the
+ * computer and the request, and the two actions. On a verdict the ring and the
+ * headline change colour and the buttons disappear, because the question is
+ * already answered.
+ *
+ * @param reduceMotion system animation preference; the ring then renders as a
+ *   static arc instead of an animated sweep.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ApprovalContent(promptText: String, onApprove: () -> Unit, onCancel: () -> Unit) {
+private fun ApprovalContent(
+    state: ApprovalScreenState,
+    reduceMotion: Boolean,
+    onApprove: () -> Unit,
+    onCancel: () -> Unit,
+) {
     DeUnlockTheme {
         Scaffold(
             topBar = {
@@ -779,55 +939,126 @@ private fun ApprovalContent(promptText: String, onApprove: () -> Unit, onCancel:
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Spacer(modifier = Modifier.height(APPROVAL_SECTION_SPACING_DP))
-                    Icon(
-                        imageVector = Icons.Filled.Lock,
-                        contentDescription = null,
-                        modifier = Modifier.size(APPROVAL_ICON_SIZE_DP),
-                        tint = MaterialTheme.colorScheme.primary,
+                    val accent = ringColour(state)
+                    Box(
+                        modifier = Modifier.size(APPROVAL_RING_SIZE_DP),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            val stroke = APPROVAL_RING_STROKE_DP.toPx()
+                            val inset = stroke / 2f
+                            val arcSize = Size(size.width - stroke, size.height - stroke)
+                            drawArc(
+                                color = SyBorder,
+                                startAngle = RING_START_ANGLE,
+                                sweepAngle = RING_FULL_SWEEP,
+                                useCenter = false,
+                                topLeft = Offset(inset, inset),
+                                size = arcSize,
+                                style = Stroke(width = stroke),
+                            )
+                            // A finished question keeps a full ring; a live one
+                            // shrinks. With reduced motion asked for, the ring stays
+                            // whole and only the numeral changes — the countdown is
+                            // still readable, nothing moves under the operator.
+                            val sweep = when {
+                                !state.isOpen -> RING_FULL_SWEEP
+                                reduceMotion -> RING_FULL_SWEEP
+                                else -> RING_FULL_SWEEP * state.fractionRemaining
+                            }
+                            drawArc(
+                                color = accent,
+                                startAngle = RING_START_ANGLE,
+                                sweepAngle = sweep,
+                                useCenter = false,
+                                topLeft = Offset(inset, inset),
+                                size = arcSize,
+                                style = Stroke(width = stroke, cap = StrokeCap.Round),
+                            )
+                        }
+                        Text(
+                            text = when (state.outcome) {
+                                null -> state.remainingSeconds.toString()
+                                ApprovalOutcome.Granted -> "OK"
+                                is ApprovalOutcome.Denied -> "!"
+                            },
+                            color = accent,
+                            fontSize = APPROVAL_RING_NUMERAL_SP,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.semantics {
+                                testTag = APPROVAL_COUNTDOWN_TEST_TAG
+                                contentDescription = if (state.isOpen) {
+                                    "${state.remainingSeconds} seconds left"
+                                } else {
+                                    approvalHeadline(state)
+                                }
+                            },
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(APPROVAL_SECTION_SPACING_DP))
+                    Text(
+                        text = approvalHeadline(state),
+                        color = accent,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = APPROVAL_HEADLINE_TRACKING_EM.em,
+                        textAlign = TextAlign.Center,
                     )
                     Spacer(modifier = Modifier.height(APPROVAL_SECTION_SPACING_DP))
                     Text(
-                        text = promptText,
+                        text = state.promptText,
                         style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.onBackground,
                         textAlign = TextAlign.Center,
                     )
+                    (state.outcome as? ApprovalOutcome.Denied)?.let { denied ->
+                        Spacer(modifier = Modifier.height(APPROVAL_SECTION_SPACING_DP))
+                        Text(
+                            text = denied.reason,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = SyTextDim,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
                     Spacer(modifier = Modifier.weight(1f))
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = APPROVAL_BUTTON_HORIZONTAL_PADDING_DP),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                    ) {
-                        Button(
-                            onClick = onApprove,
+                    if (state.isOpen) {
+                        Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(APPROVAL_BUTTON_HEIGHT_DP),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.primary,
-                                contentColor = MaterialTheme.colorScheme.onPrimary,
-                            ),
+                                .padding(horizontal = APPROVAL_BUTTON_HORIZONTAL_PADDING_DP),
+                            horizontalAlignment = Alignment.CenterHorizontally,
                         ) {
-                            Text(
-                                text = "Approve",
-                                style = MaterialTheme.typography.titleMedium,
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(APPROVAL_BUTTON_SPACING_DP))
-                        OutlinedButton(
-                            onClick = onCancel,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(APPROVAL_BUTTON_HEIGHT_DP),
-                            colors = ButtonDefaults.outlinedButtonColors(
-                                contentColor = MaterialTheme.colorScheme.error,
-                            ),
-                        ) {
-                            Text(
-                                text = "Cancel",
-                                style = MaterialTheme.typography.titleMedium,
-                            )
+                            Button(
+                                onClick = onApprove,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(APPROVAL_BUTTON_HEIGHT_DP),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.primary,
+                                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                                ),
+                            ) {
+                                Text(
+                                    text = "Approve",
+                                    style = MaterialTheme.typography.titleMedium,
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(APPROVAL_BUTTON_SPACING_DP))
+                            OutlinedButton(
+                                onClick = onCancel,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(APPROVAL_BUTTON_HEIGHT_DP),
+                                colors = ButtonDefaults.outlinedButtonColors(
+                                    contentColor = MaterialTheme.colorScheme.error,
+                                ),
+                            ) {
+                                Text(
+                                    text = "Cancel",
+                                    style = MaterialTheme.typography.titleMedium,
+                                )
+                            }
                         }
                     }
                     Spacer(modifier = Modifier.height(APPROVAL_SECTION_SPACING_DP))
@@ -836,6 +1067,15 @@ private fun ApprovalContent(promptText: String, onApprove: () -> Unit, onCancel:
         }
     }
 }
+
+/** Ring starts at twelve o'clock rather than three. */
+private const val RING_START_ANGLE: Float = -90f
+
+/** A full circle in degrees. */
+private const val RING_FULL_SWEEP: Float = 360f
+
+/** Test tag on the numeral inside the ring. */
+internal const val APPROVAL_COUNTDOWN_TEST_TAG: String = "deunlock.approve.countdown"
 
 /**
  * Build a fresh [Intent] that the production
