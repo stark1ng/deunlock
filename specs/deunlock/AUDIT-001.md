@@ -880,3 +880,96 @@ systemd user service (`deunlock-presenced.service`, `Restart=on-failure`) →
 subscribes → `pamtester sudo roma authenticate` → `successfully authenticated`
 (3.2 s, audit `success`) → plain `sudo true` → exit 0 in 12.2 s with a
 fingerprint on the phone and no password typed.
+
+### D-27 (medium) — a cancelled challenge kept the peer's only slot, CLOSED
+
+W-1 cancels a challenge by closing the PAM-side socket as soon as the operator
+types a password. The daemon did not notice: `handle_connection` awaited
+`dispatch` for the full deadline and only then tried to write a reply nobody
+was waiting for. The consequence was not invisible — every peer has **one**
+challenge slot with a one-second queue (`BUSY_QUEUE_DEADLINE`), so the *next*
+`sudo` inside twenty-five seconds came back `busy` instead of asking the phone.
+An operator who typed a password once got a password prompt for the next
+attempt as well, with nothing on screen to explain why.
+
+Fix: for `Request::Challenge` the connection handler now waits for the caller's
+hang-up *beside* the challenge (`tokio::select!`). EOF abandons the challenge,
+which drops `issue_challenge`, releases the semaphore permit and leaves no
+half-written reply. Other request kinds are unchanged.
+
+Measured, both directions, in `crates/deunlock-presenced/tests/challenge_cancel.rs`:
+
+```
+# with the fix
+test an_abandoned_challenge_frees_the_peer_slot ... ok        (0.25 s)
+# with the select! removed (old behaviour), same test:
+test an_abandoned_challenge_frees_the_peer_slot ... FAILED    (5.17 s)
+```
+
+Still open, and deliberately: the phone is **not** told. A challenge cancelled
+from the terminal keeps its prompt on the phone until the phone's own deadline
+runs out. Withdrawing it needs a desktop→phone cancel frame and a phone-side
+handler, which belongs with the phone work in W-3; the desktop half is now
+correct on its own (slot free, no phantom `busy`).
+
+### W-1 — the terminal offers a choice instead of a wait (delivered 2026-11-12)
+
+The module no longer asks the phone silently. On a terminal it prints one line,
+reads it with echo off on the caller's own tty, and runs the challenge beside it:
+
+```
+Confirm on your phone, or type your password:
+```
+
+Shape of the race (`crates/deunlock-pam/src/choice.rs`):
+
+- one `poll()` over two descriptors — the terminal and the daemon socket — so a
+  keystroke and a signature are the same kind of event and neither can starve
+  the other;
+- **password wins**: the line is read in canonical mode (the kernel does the
+  editing), the socket is closed (*that* is the cancellation, see D-27), and the
+  bytes go to `pam_set_item(PAM_AUTHTOK)`; the module returns `PAM_IGNORE` so
+  `pam_unix` verifies them. The module never decides that a password is correct;
+- **phone wins**: the verdict is mapped exactly as before, and whatever was
+  half-typed is thrown away with `tcflush(TCIFLUSH)` — a phone approval must not
+  leave the first characters of a password in the queue for the next prompt;
+- **neither**: the window expires, echo is restored, our line is closed with a
+  newline, and the next module's password prompt appears on a clean line;
+- echo is restored by `Drop` on the terminal guard, so every early return, error
+  and panic leaves the operator's terminal as it was found;
+- with no terminal (`cron`, a pipe, an sshd session without a pty) nothing is
+  printed and the full `timeout=` budget still applies;
+- `phone=off` and `DEUNLOCK_OFF=1` skip the phone entirely — no socket, no
+  prompt — so a broken pairing degrades to a normal password prompt.
+
+Budgets: 6 s for the phone side when typing is possible (measured: ~4 s from
+notification to sensor on the reference phone), the existing 27 s when it is
+not, `choice=<ms>` to override.
+
+Evidence — `crates/deunlock-pam/tests/choice_pty.rs`, five tests over a real
+`openpty` pair, no mocks standing in for the terminal:
+
+```
+test password_first_wins_and_cancels_the_challenge ... ok
+     typed line returned, prompt printed, password absent from the terminal and
+     from the request frame, daemon saw the socket close, echo restored
+test phone_first_wins_and_discards_what_was_typed ... ok
+     verdict is the phone's; the half-typed line is gone from the queue
+test neither_side_answers_returns_the_deadline_with_a_clean_terminal ... ok
+     1.0 s window honoured, line closed, echo on again, terminal still usable
+test phone_off_touches_neither_the_daemon_nor_the_terminal ... ok
+     zero connections, no prompt
+test deunlock_off_in_the_environment_disables_the_phone ... ok
+```
+
+`crates/deunlock-pam/tests/pam_choice_e2e.rs` (gated on `DEUNLOCK_E2E=1`) asks
+the same question of the installed module inside the production `sudo` stack
+and types a deliberately wrong password: the choice line must appear, no second
+`Password:` prompt may follow (proving `pam_unix` read `PAM_AUTHTOK`), and the
+attempt must fail (proving `PAM_IGNORE`, not `PAM_SUCCESS`).
+
+Suite: `cargo test --workspace -j 3` → 649 passed, 0 failed, 11 ignored;
+`cargo clippy --workspace --all-targets -j 3 -- -D warnings` clean. Three
+`redundant_closure` warnings in `runtime.rs` / `pair_code.rs` / `pair_qr.rs`
+surfaced under the current clippy and were fixed in passing — no behaviour
+change.

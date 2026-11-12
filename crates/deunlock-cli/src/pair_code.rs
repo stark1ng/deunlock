@@ -45,10 +45,7 @@ pub struct PairCodeOpts {
 /// Nothing: the default is compiled in, and the environment override is a path.
 #[must_use]
 pub fn default_offer_path() -> PathBuf {
-    std::env::var_os("DEUNLOCK_PAIRING_OFFER").map_or_else(
-        || deunlock_core::default_pairing_offer_path(),
-        PathBuf::from,
-    )
+    std::env::var_os("DEUNLOCK_PAIRING_OFFER").map_or_else(deunlock_core::default_pairing_offer_path, PathBuf::from)
 }
 
 /// Run the command.

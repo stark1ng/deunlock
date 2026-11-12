@@ -20,8 +20,9 @@ The loop works on a real machine, not a stand:
 | PAM module in the real `sudo` | works | `sudo mkdir -p /opt/…` → `drwxr-xr-x root root`, 4.4 s, audit `success` |
 | Bilateral revoke (D-14) | works | `outcome=bond-revoked`, `peers_after=0` |
 | Phone noticing a forgotten bond (D-26/D-26b) | works | `session service absent after 3 discoveries … parked`, resumes after re-pair |
-| Rust suite | 636 tests, clippy `-D warnings` clean | `cargo test --workspace -j 3`, `/tmp/f17.log` |
+| Rust suite | 649 tests, clippy `-D warnings` clean | `cargo test --workspace -j 3`, `/tmp/f19.log` |
 | Android unit tests + APK | green, installs over Wi-Fi | `testDebugUnitTest assembleDebug` |
+| The terminal offers a choice (W-1) | works in tests | `tests/choice_pty.rs` 5/5; `an_abandoned_challenge_frees_the_peer_slot` |
 
 Not wired yet: every PAM surface except `sudo`. On this machine `lightdm`,
 `lightdm-greeter`, `lightdm-autologin` and `login` exist; `polkit-1` does not
@@ -45,10 +46,19 @@ Not wired yet: every PAM surface except `sudo`. On this machine `lightdm`,
 8. **Commit per work package**, with the measurement in the message. Push to
    `main` only after the suite and the linter are green.
 
-## W-1 — the terminal offers a choice instead of a wait
+## W-1 — the terminal offers a choice instead of a wait (delivered 2026-11-12)
 
 **Why**: today the phone is asked silently and the password prompt only appears
 after the deadline; an operator who wanted to type never gets the chance.
+
+**Delivered**: `crates/deunlock-pam/src/choice.rs` prints the one line, polls the
+caller's tty beside the daemon socket and takes whichever answers first; a typed
+password is stored as `PAM_AUTHTOK` and the module returns `PAM_IGNORE`, so
+`pam_unix` verifies it and the module never authenticates a password itself.
+`phone=off` / `DEUNLOCK_OFF=1` skip the phone (no socket, no prompt). The daemon
+now abandons a challenge whose caller hung up instead of holding the peer's only
+slot (AUDIT-001 D-27). Evidence, budgets and the open phone-side withdrawal are
+in AUDIT-001 under W-1.
 
 **Deliverables**
 - `deunlock-pam`: a caller conversation that prints one line
@@ -179,7 +189,7 @@ independent; W-4 before W-5 because the tray's bond list is only interesting onc
 there is more than one bond; W-6 anywhere after W-2.
 
 Each package's gate: `cargo test --workspace -j 3` and
-`cargo clippy --workspace --all-targets -j 3 -- -D warnings` green (currently 636
+`cargo clippy --workspace --all-targets -j 3 -- -D warnings` green (currently 649
 tests); Kotlin `testDebugUnitTest` green when Android code moved; a live log line
 or a rendered frame for whatever the package claims; AUDIT-001 updated with what
 was measured; one commit, pushed.

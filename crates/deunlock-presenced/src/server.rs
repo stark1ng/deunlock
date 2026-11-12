@@ -25,6 +25,7 @@ use std::{
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use thiserror::Error;
 use tokio::{
+    io::AsyncReadExt as _,
     net::{UnixListener, UnixStream},
     sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinHandle,
@@ -321,17 +322,63 @@ async fn handle_connection(mut stream: UnixStream, ctx: ConnContext) -> Result<(
     }
     let request: Request = read_frame(&mut stream).await?;
     tracing::debug!(?request, "request decoded");
-    let response = dispatch(
-        &request,
-        &ctx.reload_tx,
-        ctx.orchestrator.as_ref(),
-        ctx.test_fixed_nonce,
-        ctx.started_at,
-        ctx.host_id,
-    )
-    .await;
+    // A `Challenge` is the one request that can hold the peer's slot for
+    // twenty-five seconds while the phone decides. The caller must keep the
+    // connection open to collect the reply, so a hang-up means it no longer
+    // wants the answer: W-1's PAM module closes the socket the moment the
+    // operator types a password instead. Abandon the challenge rather than
+    // answering a caller that is gone (AUDIT-001 D-27).
+    let response = match &request {
+        Request::Challenge { .. } => {
+            let mut hangup = std::pin::pin!(wait_for_hangup(&mut stream));
+            tokio::select! {
+                response = dispatch(
+                    &request,
+                    &ctx.reload_tx,
+                    ctx.orchestrator.as_ref(),
+                    ctx.test_fixed_nonce,
+                    ctx.started_at,
+                    ctx.host_id,
+                ) => Some(response),
+                () = &mut hangup => None,
+            }
+        }
+        _ => {
+            Some(
+                dispatch(
+                    &request,
+                    &ctx.reload_tx,
+                    ctx.orchestrator.as_ref(),
+                    ctx.test_fixed_nonce,
+                    ctx.started_at,
+                    ctx.host_id,
+                )
+                .await,
+            )
+        }
+    };
+    let Some(response) = response else {
+        tracing::info!("pam caller hung up mid-challenge; challenge abandoned");
+        return Ok(());
+    };
     write_frame(&mut stream, &response).await?;
     Ok(())
+}
+
+/// Resolve when the caller closes its end of the connection.
+///
+/// A `Challenge` caller sends exactly one frame and then reads; anything it
+/// writes afterwards is not part of the protocol and is ignored, so the only
+/// interesting event on this socket is EOF (or a broken pipe, which means the
+/// same thing from our side).
+async fn wait_for_hangup(stream: &mut UnixStream) {
+    let mut scratch = [0u8; 64];
+    loop {
+        match stream.read(&mut scratch).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => continue,
+        }
+    }
 }
 
 /// Dispatcher for the daemon's typed RPC.

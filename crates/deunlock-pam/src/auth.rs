@@ -307,19 +307,72 @@ impl PamContext {
 #[must_use]
 pub fn authenticate_with_context(cfg: &Config, ctx: &PamContext) -> AuthOutcome {
     let outcome = authenticate_inner(cfg, ctx);
-    // Best-effort audit log; failure here does not change the PAM
-    // code (SPEC §6 audit is a forensic surface, not a control flow
-    // surface).
-    let _ = append_last_log(cfg, &outcome);
+    record_outcome(cfg, &outcome);
     outcome
 }
 
+/// Append the audit line for `outcome` to `<bond_dir>/last.log`.
+///
+/// Best-effort: failure here does not change the PAM code (SPEC §6 audit is a
+/// forensic surface, not a control flow surface). Exposed so the W-1 choice
+/// path records a phone verdict exactly once — a typed password is never
+/// written here, because it is never an `AuthOutcome`.
+pub(crate) fn record_outcome(cfg: &Config, outcome: &AuthOutcome) {
+    let _ = append_last_log(cfg, outcome);
+}
+
 fn authenticate_inner(cfg: &Config, ctx: &PamContext) -> AuthOutcome {
+    // The challenge is put on the wire by `begin_challenge` and answered by
+    // `PendingChallenge::read_answer`. W-1 needs exactly the same two steps,
+    // but with the caller's terminal polled in between, so the split lives
+    // here rather than in the choice module.
+    match begin_challenge(cfg, ctx) {
+        Ok(mut pending) => pending.read_answer(),
+        Err(outcome) => outcome,
+    }
+}
+
+/// A `Request::Challenge` already on the wire, waiting for the daemon's answer.
+///
+/// Dropping it closes the socket, which is how W-1 cancels a challenge: the
+/// daemon notices the caller went away and releases the peer slot instead of
+/// holding it for the full deadline (see `server::handle_connection`).
+pub(crate) struct PendingChallenge {
+    /// The connected daemon socket, positioned at the start of the reply.
+    pub(crate) stream: UnixStream,
+    /// Bonded peer this challenge was issued against.
+    pub(crate) peer_id: String,
+    /// The nonce the phone must sign; the reply is checked against it.
+    pub(crate) nonce: [u8; NONCE_LEN],
+}
+
+impl PendingChallenge {
+    /// Read the daemon's answer and turn it into a verdict.
+    ///
+    /// Blocks up to `cfg.auth_timeout`. The W-1 race polls the socket for
+    /// readiness first and calls [`resolve_response`] with the frame it read,
+    /// so this is the phone-only path.
+    pub(crate) fn read_answer(&mut self) -> AuthOutcome {
+        match read_frame_blocking::<_, Response>(&mut self.stream) {
+            Ok(response) => resolve_response(&self.peer_id, &self.nonce, response),
+            // Read timeout / decode error collapse to one `transport-error`
+            // reason; the caller's stack then falls through to the password.
+            Err(_) => AuthOutcome::AuthInfoUnavail {
+                reason: OUTCOME_REASON_TRANSPORT_ERROR,
+                peer_id: Some(self.peer_id.clone()),
+            },
+        }
+    }
+}
+
+/// Resolve the peer, mint the nonce and put the challenge on the wire.
+///
+/// Returns the connected socket ready to be read. Every early return is an
+/// [`AuthOutcome`] the caller bubbles up unchanged, so the empty-store and
+/// daemon-down paths behave exactly as they did before W-1.
+pub(crate) fn begin_challenge(cfg: &Config, ctx: &PamContext) -> Result<PendingChallenge, AuthOutcome> {
     // -- step 1: load the bond store to pick a peer_id ------------------
-    let peer_id = match resolve_peer_id(cfg) {
-        Ok(id) => id,
-        Err(outcome) => return outcome,
-    };
+    let peer_id = resolve_peer_id(cfg)?;
 
     // -- step 2: fresh nonce for the wire frame ------------------------
     let mut nonce = [0u8; NONCE_LEN];
@@ -329,32 +382,37 @@ fn authenticate_inner(cfg: &Config, ctx: &PamContext) -> AuthOutcome {
         Some(fixed) => nonce = fixed,
         None => {
             if getrandom_fill(&mut nonce).is_err() {
-                return AuthOutcome::AuthInfoUnavail {
+                return Err(AuthOutcome::AuthInfoUnavail {
                     reason: OUTCOME_REASON_TRANSPORT_ERROR,
                     peer_id: Some(peer_id),
-                };
+                });
             }
         }
     }
 
-    // -- step 3: daemon round-trip --------------------------------------
-    let response = match daemon_round_trip(&cfg.socket_path, &peer_id, &nonce, cfg.auth_timeout, ctx) {
-        Ok(r) => r,
+    // -- step 3: connect and send --------------------------------------
+    let stream = match send_challenge(&cfg.socket_path, &peer_id, &nonce, cfg.auth_timeout, ctx) {
+        Ok(s) => s,
         Err(()) => {
-            // Connect-refused / socket missing / write fail / read
-            // timeout / decode error all collapse to a single
-            // `transport-error` reason. The unit test
-            // `authenticate_falls_through_when_daemon_socket_missing`
-            // asserts wall-clock ≤ 50 ms for the connect-refused
-            // path.
-            return AuthOutcome::AuthInfoUnavail {
+            // Connect-refused / socket missing / write fail all collapse to a
+            // single `transport-error` reason. The unit test
+            // `authenticate_falls_through_when_daemon_socket_missing` asserts
+            // wall-clock ≤ 50 ms for the connect-refused path.
+            return Err(AuthOutcome::AuthInfoUnavail {
                 reason: OUTCOME_REASON_TRANSPORT_ERROR,
                 peer_id: Some(peer_id),
-            };
+            });
         }
     };
 
-    // -- step 4: validate the echo, then map the reason to a PAM code ----
+    Ok(PendingChallenge { stream, peer_id, nonce })
+}
+
+/// Validate one decoded `Response::Challenge` and map it onto a verdict.
+///
+/// Split out of the old `authenticate_inner` so the W-1 race can hand in a
+/// frame it read itself without duplicating a single check.
+pub(crate) fn resolve_response(peer_id: &str, nonce: &[u8; NONCE_LEN], response: Response) -> AuthOutcome {
     match response {
         Response::Challenge {
             ok,
@@ -370,7 +428,7 @@ fn authenticate_inner(cfg: &Config, ctx: &PamContext) -> AuthOutcome {
             if echoed_peer != peer_id || echoed_nonce.as_slice() != nonce.as_slice() {
                 return AuthOutcome::AuthErr {
                     reason: OUTCOME_REASON_REQUEST_MISMATCH,
-                    peer_id: Some(peer_id),
+                    peer_id: Some(peer_id.to_owned()),
                 };
             }
 
@@ -382,22 +440,24 @@ fn authenticate_inner(cfg: &Config, ctx: &PamContext) -> AuthOutcome {
             if (reason == OUTCOME_REASON_OK && (!ok || !has_signature)) || (reason != OUTCOME_REASON_OK && ok) {
                 return AuthOutcome::AuthErr {
                     reason: OUTCOME_REASON_BAD_SIGNATURE,
-                    peer_id: Some(peer_id),
+                    peer_id: Some(peer_id.to_owned()),
                 };
             }
 
             let (code, static_reason) = outcome_reason_to_pam(&reason);
             if code == PAM_SUCCESS {
-                AuthOutcome::Success { peer_id }
+                AuthOutcome::Success {
+                    peer_id: peer_id.to_owned(),
+                }
             } else if code == PAM_AUTHINFO_UNAVAIL {
                 AuthOutcome::AuthInfoUnavail {
                     reason: static_reason,
-                    peer_id: Some(peer_id),
+                    peer_id: Some(peer_id.to_owned()),
                 }
             } else {
                 AuthOutcome::AuthErr {
                     reason: static_reason,
-                    peer_id: Some(peer_id),
+                    peer_id: Some(peer_id.to_owned()),
                 }
             }
         }
@@ -408,7 +468,7 @@ fn authenticate_inner(cfg: &Config, ctx: &PamContext) -> AuthOutcome {
         // through.
         _ => AuthOutcome::AuthInfoUnavail {
             reason: OUTCOME_REASON_TRANSPORT_ERROR,
-            peer_id: Some(peer_id),
+            peer_id: Some(peer_id.to_owned()),
         },
     }
 }
@@ -462,16 +522,20 @@ fn getrandom_fill(buf: &mut [u8]) -> Result<(), ()> {
     getrandom::fill(buf).map_err(|_| ())
 }
 
-/// Open the daemon's Unix socket, write one `Request::Challenge`,
-/// read one `Response`. Returns `Err(())` on any failure — the
+/// Open the daemon's Unix socket, write one `Request::Challenge`, and hand back
+/// the connected stream for the reply. Returns `Err(())` on any failure — the
 /// caller maps that to `OUTCOME_REASON_TRANSPORT_ERROR`.
-fn daemon_round_trip(
+///
+/// The read stays outside on purpose: the reply is either read straight away
+/// ([`PendingChallenge::read_answer`]) or raced against the caller's terminal
+/// (W-1), and both paths must share the same socket setup.
+fn send_challenge(
     socket_path: &Path,
     peer_id: &str,
     nonce: &[u8; NONCE_LEN],
     auth_timeout: Duration,
     ctx: &PamContext,
-) -> Result<Response, ()> {
+) -> Result<UnixStream, ()> {
     let mut stream = match UnixStream::connect_addr_from_path(socket_path) {
         Ok(s) => s,
         Err(_) => return Err(()),
@@ -491,7 +555,7 @@ fn daemon_round_trip(
     if write_frame_blocking(&mut stream, &request).is_err() {
         return Err(());
     }
-    read_frame_blocking::<_, Response>(&mut stream).map_err(|_| ())
+    Ok(stream)
 }
 
 /// `UnixStream::connect_timeout`-equivalent that takes a `Path`

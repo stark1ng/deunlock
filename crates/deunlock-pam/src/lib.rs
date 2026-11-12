@@ -37,5 +37,6 @@
 //! either invisible or leaks into the user's terminal — both are bugs.
 
 pub mod auth;
+pub mod choice;
 pub mod config;
 pub mod entry;

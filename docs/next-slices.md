@@ -5,30 +5,17 @@ code proved → subscribed → PAM on the real `sudo` → `sudo mkdir` as root w
 fingerprint and no password). Everything below is unbuilt work, not a bug list —
 bugs live in `specs/deunlock/AUDIT-001.md`.
 
-## Slice 1 — the terminal must offer a choice, not a wait
+## Slice 1 — done: the terminal offers a choice, not a wait
 
-Today the module is `sufficient` with a 27 s budget, so the phone is tried
-silently and the password prompt only appears after the deadline. Two things are
-wrong with that: nothing on screen says the phone is being asked, and an operator
-who wants to type a password has to sit through the whole wait.
-
-Design: the module opens a `PAM_PROMPT_ECHO_OFF` conversation on the caller's own
-terminal *and* starts the challenge, then takes whichever answers first.
-
-- Print one line before anything: `Confirm on your phone, or type your password:`.
-- Read the password in a bounded loop (`poll()` on the tty) interleaved with the
-  daemon reply, so a keystroke cancels the phone request instead of being ignored.
-- Cap the phone side of that race at a few seconds (a typist wins immediately;
-  a phone user reaches the sensor in ~4 s, measured), and keep the full deadline
-  only for services that cannot type at all (`gdm-password`).
-- On a typed password: hand it back as the PAM authtok, never log it, never
-  forward it to the daemon.
-- Escape hatch: `DEUNLOCK_OFF=1` and `--module-args phone=off` skip the phone
-  entirely, so a broken pairing never becomes a broken machine.
-
-Tests: a pty-driven test where the password arrives first and the phone is
-cancelled; one where the phone answers first and the typed byte is discarded;
-one where neither answers inside the deadline.
+Delivered 2026-11-12. The module prints one line, reads the caller's tty with
+echo off beside the running challenge, and takes whichever answers first: a
+typed password becomes `PAM_AUTHTOK` and the stack continues (`PAM_IGNORE`), a
+signature wins as before, and `phone=off` / `DEUNLOCK_OFF=1` skip the phone
+without touching the terminal. `choice=<ms>` caps the phone side while a
+keyboard is available; without a terminal the full `timeout=` budget still
+applies. Measurements, the five pty tests and the one defect this exposed
+(D-27, the daemon holding the peer's slot for a caller that had gone away) are
+in `AUDIT-001.md`.
 
 ## Slice 2 — the surface the project promised
 

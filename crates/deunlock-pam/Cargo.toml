@@ -41,7 +41,7 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 thiserror = "2"
 # `nix::unistd::geteuid` for the `/run/user/$UID` fallback when
 # `XDG_RUNTIME_DIR` is unset (SPEC §8 Risks row).
-nix = { version = "0.29", features = ["user", "fs"] }
+nix = { version = "0.29", features = ["user", "fs", "poll", "term"] }
 
 [dev-dependencies]
 # Tests bind ephemeral Unix-domain sockets under tempdirs.
@@ -54,6 +54,8 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 # daemon's `--peripheral=fake` test seam.
 ed25519-dalek = "2"
 hex = "0.4"
+# W-1 pty tests: `openpty` + `poll` + termios on a real pseudoterminal.
+nix = { version = "0.29", features = ["term", "poll"] }
 
 # The workspace bans `unsafe_code` by default, but the entire purpose of this
 # crate is to expose `unsafe extern "C"` symbols across the libpam ABI. We

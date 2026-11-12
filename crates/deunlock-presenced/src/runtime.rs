@@ -431,10 +431,7 @@ async fn start_lan(config: &Config, host_id: Option<[u8; 32]>) -> Option<Arc<dyn
     // Pairing is always armed on the listener: with no offer file present a `DLP1`
     // record is refused, so being armed costs nothing and means `deunlock pair-qr`
     // works without restarting the daemon.
-    let offer_path = std::env::var_os("DEUNLOCK_PAIRING_OFFER").map_or_else(
-        || deunlock_core::default_pairing_offer_path(),
-        std::path::PathBuf::from,
-    );
+    let offer_path = std::env::var_os("DEUNLOCK_PAIRING_OFFER").map_or_else(deunlock_core::default_pairing_offer_path, std::path::PathBuf::from);
     let server = server.with_pairing(
         std::sync::Arc::new(deunlock_net::FilePairingOffers::new(offer_path.clone())),
         std::sync::Arc::new(QrBondSink::new(config.bonds_file.clone(), config.keys_dir.clone())),
@@ -617,7 +614,7 @@ async fn maybe_spawn_orchestrator(
         // Same hand-off file the QR path uses: `deunlock pair-code` writes it,
         // the daemon verifies codes against it and deletes it on success.
         let offer_path_for_pair = std::env::var_os("DEUNLOCK_PAIRING_OFFER").map_or_else(
-            || deunlock_core::default_pairing_offer_path(),
+            deunlock_core::default_pairing_offer_path,
             std::path::PathBuf::from,
         );
         // The pair write is tagged under (host_pubkey, phone_pubkey, bond), so

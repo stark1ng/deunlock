@@ -24,7 +24,7 @@ use std::{
 
 use syslog::{Facility, Formatter3164};
 
-use crate::{auth, config::Config};
+use crate::{auth, choice, config::Config};
 
 // -----------------------------------------------------------------------------
 // libpam items
@@ -36,12 +36,28 @@ const PAM_ITEM_SERVICE: c_int = 1;
 /// `PAM_USER` — the account being authenticated.
 const PAM_ITEM_USER: c_int = 2;
 
+/// `PAM_TTY` — the caller's terminal, when the stack has one. `sudo` sets it;
+/// a pipe or a `cron` job does not. W-1 uses it as the first candidate for the
+/// choice prompt, falling back to `/dev/tty`.
+const PAM_ITEM_TTY: c_int = 3;
+
+/// `PAM_AUTHTOK` — the cached authentication token. W-1 stores a typed password
+/// here so the next module in the stack (`pam_unix`) verifies it without
+/// prompting again.
+const PAM_ITEM_AUTHTOK: c_int = 6;
+
 // libpam exports these symbols into the process that loaded us; the dynamic
 // loader resolves them at load time. Declaring them here is the whole cost of
 // reading PAM items — no `pam-sys` dependency needed.
 unsafe extern "C" {
     /// `int pam_get_item(const pam_handle_t *, int, const void **)`.
     fn pam_get_item(pamh: *const c_void, item_type: c_int, item: *mut *const c_void) -> c_int;
+
+    /// `int pam_set_item(pam_handle_t *, int, const void *)`.
+    ///
+    /// libpam copies the string for `PAM_AUTHTOK`; the module keeps no
+    /// reference to it after the call returns.
+    fn pam_set_item(pamh: *mut c_void, item_type: c_int, item: *const c_void) -> c_int;
 }
 
 /// Read one string item from the PAM handle.
@@ -221,12 +237,13 @@ pub unsafe extern "C" fn pam_sm_authenticate(pamh: *mut c_void, _flags: c_int, a
         // total even on hostile callers.
         let argv_strings = unsafe { collect_pam_argv(argc, argv) };
         let argv_refs: Vec<&str> = argv_strings.iter().map(String::as_str).collect();
-        // SAFETY: `pamh` is the live handle libpam passed us; both helpers
+        // SAFETY: `pamh` is the live handle libpam passed us; all three helpers
         // tolerate a null handle by returning `None`.
-        let (service, user) = unsafe {
+        let (service, user, tty) = unsafe {
             (
                 pam_string_item(pamh, PAM_ITEM_SERVICE),
                 pam_string_item(pamh, PAM_ITEM_USER),
+                pam_string_item(pamh, PAM_ITEM_TTY),
             )
         };
         // The socket belongs to the account being authenticated, not to the
@@ -236,15 +253,68 @@ pub unsafe extern "C" fn pam_sm_authenticate(pamh: *mut c_void, _flags: c_int, a
             service: service.unwrap_or_else(|| "unknown".to_string()),
             user: user.unwrap_or_else(|| "unknown".to_string()),
         };
-        let outcome = auth::authenticate_with_context(&cfg, &ctx);
-        log_info(&format!(
-            "deunlock: unlock {} reason={} peer_id={}",
-            if outcome.is_success() { "success" } else { "denied" },
-            outcome.reason(),
-            outcome.peer_id().unwrap_or(auth::LAST_LOG_UNKNOWN_PEER),
-        ));
-        outcome.to_pam_code()
+
+        // W-1: one prompt on the caller's terminal, the challenge beside it,
+        // whichever answers first wins.
+        match choice::run(&cfg, &ctx, &argv_refs, tty.as_deref()) {
+            choice::Choice::Phone(outcome) => {
+                auth::record_outcome(&cfg, &outcome);
+                log_info(&format!(
+                    "deunlock: unlock {} reason={} peer_id={}",
+                    if outcome.is_success() { "success" } else { "denied" },
+                    outcome.reason(),
+                    outcome.peer_id().unwrap_or(auth::LAST_LOG_UNKNOWN_PEER),
+                ));
+                outcome.to_pam_code()
+            }
+            choice::Choice::Password(secret) => {
+                // The operator typed. This module does not know their password
+                // and must not learn it: the bytes go into PAM_AUTHTOK and the
+                // stack continues to a module that can actually verify them.
+                // `PAM_IGNORE` (not `PAM_SUCCESS`) is the whole point — a typed
+                // password alone never authenticates anything.
+                // SAFETY: `pamh` is the handle libpam passed into this entry
+                // point; `set_authtok` tolerates a null handle.
+                if unsafe { set_authtok(pamh, secret.expose()) } {
+                    log_info("deunlock: unlock fallback reason=password-typed peer_id=unknown");
+                    PAM_IGNORE
+                } else {
+                    log_info("deunlock: unlock fallback reason=authtok-rejected peer_id=unknown");
+                    PAM_AUTHINFO_UNAVAIL
+                }
+            }
+            choice::Choice::Deadline => {
+                log_info("deunlock: unlock fallback reason=choice-deadline peer_id=unknown");
+                PAM_AUTHINFO_UNAVAIL
+            }
+            choice::Choice::PhoneDisabled => {
+                log_info("deunlock: unlock fallback reason=phone-disabled peer_id=unknown");
+                PAM_AUTHINFO_UNAVAIL
+            }
+        }
     })
+}
+
+/// Store the operator's typed password as the PAM authtok.
+///
+/// Returns `false` when the handle is null, the bytes are not a valid C string
+/// (an interior NUL cannot be a password) or libpam refuses the item. The
+/// buffer is owned by [`crate::choice::SecretBytes`] and zeroed when it drops;
+/// nothing here logs or copies it.
+///
+/// # Safety
+///
+/// `pamh` must be the handle libpam passed into the entry point, or null.
+unsafe fn set_authtok(pamh: *mut c_void, secret: &[u8]) -> bool {
+    if pamh.is_null() {
+        return false;
+    }
+    let Ok(token) = std::ffi::CString::new(secret) else {
+        return false;
+    };
+    // SAFETY: `pamh` is the live handle per this function's contract; `token`
+    // outlives the call and libpam copies the value it stores.
+    unsafe { pam_set_item(pamh, PAM_ITEM_AUTHTOK, token.as_ptr().cast()) == PAM_SUCCESS }
 }
 
 /// Copy libpam's `argv` into owned `String`s.

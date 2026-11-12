@@ -95,7 +95,7 @@ pub fn run(opts: &PairQrOpts, host_key_path: &Path, cert_path: &Path, key_path: 
         .offer_path
         .clone()
         .or_else(|| std::env::var_os("DEUNLOCK_PAIRING_OFFER").map(PathBuf::from))
-        .unwrap_or_else(|| deunlock_core::default_pairing_offer_path());
+        .unwrap_or_else(deunlock_core::default_pairing_offer_path);
     let wrote_offer = match deunlock_core::PendingOffer::from_offer(&offer).write(&offer_path) {
         Ok(()) => true,
         Err(err) => {
