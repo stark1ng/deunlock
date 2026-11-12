@@ -256,14 +256,21 @@ pub unsafe extern "C" fn pam_sm_authenticate(pamh: *mut c_void, _flags: c_int, a
 
         // W-1: one prompt on the caller's terminal, the challenge beside it,
         // whichever answers first wins.
+        //
+        // Every line below carries `tty=` because the terminal is what decides
+        // whether the choice is offered at all: `PAM_TTY` is a path for sudo and
+        // login, absent or a bare service name for a GUI stack. Without it in the
+        // log, "why did I get no prompt at the lock screen" has no answer.
+        let tty_label = tty.as_deref().unwrap_or("none");
         match choice::run(&cfg, &ctx, &argv_refs, tty.as_deref()) {
             choice::Choice::Phone(outcome) => {
                 auth::record_outcome(&cfg, &outcome);
                 log_info(&format!(
-                    "deunlock: unlock {} reason={} peer_id={}",
+                    "deunlock: unlock {} reason={} peer_id={} tty={}",
                     if outcome.is_success() { "success" } else { "denied" },
                     outcome.reason(),
                     outcome.peer_id().unwrap_or(auth::LAST_LOG_UNKNOWN_PEER),
+                    tty_label,
                 ));
                 outcome.to_pam_code()
             }
@@ -276,19 +283,19 @@ pub unsafe extern "C" fn pam_sm_authenticate(pamh: *mut c_void, _flags: c_int, a
                 // SAFETY: `pamh` is the handle libpam passed into this entry
                 // point; `set_authtok` tolerates a null handle.
                 if unsafe { set_authtok(pamh, secret.expose()) } {
-                    log_info("deunlock: unlock fallback reason=password-typed peer_id=unknown");
+                    log_info(&format!("deunlock: unlock fallback reason=password-typed peer_id=unknown tty={tty_label}"));
                     PAM_IGNORE
                 } else {
-                    log_info("deunlock: unlock fallback reason=authtok-rejected peer_id=unknown");
+                    log_info(&format!("deunlock: unlock fallback reason=authtok-rejected peer_id=unknown tty={tty_label}"));
                     PAM_AUTHINFO_UNAVAIL
                 }
             }
             choice::Choice::Deadline => {
-                log_info("deunlock: unlock fallback reason=choice-deadline peer_id=unknown");
+                log_info(&format!("deunlock: unlock fallback reason=choice-deadline peer_id=unknown tty={tty_label}"));
                 PAM_AUTHINFO_UNAVAIL
             }
             choice::Choice::PhoneDisabled => {
-                log_info("deunlock: unlock fallback reason=phone-disabled peer_id=unknown");
+                log_info(&format!("deunlock: unlock fallback reason=phone-disabled peer_id=unknown tty={tty_label}"));
                 PAM_AUTHINFO_UNAVAIL
             }
         }

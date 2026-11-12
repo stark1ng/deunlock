@@ -997,3 +997,34 @@ same second:
 `tests/pam_choice_e2e.rs` asserts those three properties and passes in 3.39 s
 (1 s of typing plus pam_unix's failure delay) against the installed module; run
 it with `DEUNLOCK_E2E=1`.
+
+### W-2 — measured before wiring: this machine's lock screen is not `lightdm-greeter`
+
+The plan said "`lightdm-greeter` (lock screen) wired first". Measured on this
+machine (2026-11-12), that is wrong twice over:
+
+```
+$ cat /etc/X11/default-display-manager            → /usr/sbin/lightdm
+$ loginctl show-session c1 -p Desktop -p Type     → Desktop=cinnamon, Type=x11, TTY=tty7
+$ cat /etc/pam.d/lightdm-greeter                  → auth required pam_permit.so
+$ cat /etc/pam.d/cinnamon-screensaver             → @include common-auth
+$ dpkg -L cinnamon-screensaver | grep pam-helper   → /usr/libexec/cinnamon-screensaver/cinnamon-screensaver-pam-helper
+```
+
+`lightdm-greeter` authenticates the *greeter* process (`pam_permit`: it is how
+the greeter gets to run as its own user) — it is not the user's unlock. The
+locked session is Cinnamon's screensaver, which authenticates through its own
+service file, `cinnamon-screensaver`, from a helper process. Wired first should
+be `cinnamon-screensaver`; `lightdm` stays the login-screen target.
+
+The helper's strings contain no `PAM_TTY`: a GUI stack hands the module a
+service name (or nothing), never the terminal a human is typing on. That is why
+the module now refuses the terminal choice for such a caller instead of falling
+back to `/dev/tty` — on an X session `/dev/tty` is the VT the X server owns, so
+a prompt printed there is invisible and a read races the application that does
+own the keystrokes (AUDIT-001 W-1; `tests/choice_pty.rs::a_gui_stack_gets_no_prompt_and_the_full_phone_budget`).
+
+One consequence is unavoidable and belongs to the operator, not to the module:
+the screensaver collects the password itself and only hands it to the stack when
+a module asks. So the phone deadline is also how long an already-typed password
+waits. On this machine the owner chose the full 25 s budget for the lock screen.

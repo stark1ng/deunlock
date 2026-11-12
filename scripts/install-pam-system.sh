@@ -5,21 +5,27 @@
 # `sudo`, and a refusal falls straight through to the password prompt because
 # the module is inserted as `sufficient`.
 #
-# Usage: sudo bash scripts/install-pam-system.sh [service]
+# Usage: sudo bash scripts/install-pam-system.sh [service] [module-args]
 #
-# Safety: the service file is backed up before the edit, the module is inserted
-# *before* any existing auth line, and the script refuses to continue if the
-# backup already exists (that would mean a half-finished earlier run).
+# The default module arguments are `timeout=27000`, sized for a terminal where
+# the phone is the only thing that can answer. A lock screen needs a full
+# deadline too — but see the note in docs/reference/configuration.md: there the
+# deadline is also how long an already-typed password waits, because the stack
+# only asks for it after this module declines.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE="${1:-sudo}"
+MODULE_ARGS="${2:-timeout=27000}"
 PAM_DIR=/etc/pam.d
 SERVICE_FILE="${PAM_DIR}/${SERVICE}"
 BACKUP="${SERVICE_FILE}.deunlock.bak"
 MODULE_DIR="$(pkg-config --variable=libdir pam 2>/dev/null || echo /usr/lib/x86_64-linux-gnu)/security"
 MODULE="${MODULE_DIR}/pam_deunlock.so"
-MODULE_ARGS="timeout=27000"
+
+# Safety: the service file is backed up before the edit, the module is inserted
+# *before* any existing auth line, and the script refuses to continue if the
+# backup already exists (that would mean a half-finished earlier run).
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "run this with sudo" >&2
