@@ -198,6 +198,18 @@ pub const BUSY_REASON: &str = OUTCOME_REASON_BUSY;
 /// outcome is [`ChallengeOutcome::Busy`].
 pub const BUSY_QUEUE_DEADLINE: StdDuration = StdDuration::from_millis(1000);
 
+/// How many recently issued challenges are kept per peer so a late answer can
+/// be recognised as an answer to one of them.
+///
+/// One is not enough — the answer arrives *during* the next attempt — and more
+/// than a handful is pointless, because the phone's own prompt lives for a
+/// single deadline.
+pub const ISSUED_ANSWER_KEEP: usize = 4;
+
+/// How long an issued challenge stays eligible to explain a late answer. The
+/// phone's prompt expires within a deadline; a minute is generous.
+pub const ISSUED_ANSWER_TTL: StdDuration = StdDuration::from_secs(60);
+
 /// SPEC §6 Idempotency cap: "LRU of last 64 nonces per peer". The
 /// orchestrator's per-peer [`NonceCache`] uses this as the
 /// pop-front threshold — on `insert` when `len() > NONCE_LRU_CAP`
@@ -545,6 +557,25 @@ struct PeerEntry {
     /// `acquire_challenge_slot` (connect-proxy timestamp). Read by
     /// [`Orchestrator::peers_snapshot`].
     liveness: Arc<TokioMutex<PeerLiveness>>,
+    /// Recently issued challenges, newest last.
+    ///
+    /// The phone answers with 64 bytes and no reference to the question, so
+    /// an answer to a challenge that is no longer open (the caller hung up and
+    /// W-1 cancelled it) is indistinguishable from a forged signature until it
+    /// is tried against the challenges we actually issued. Bounded by
+    /// [`ISSUED_ANSWER_KEEP`] and [`ISSUED_ANSWER_TTL`]; used only to *ignore* a
+    /// signature, never to accept one (AUDIT-001 D-28).
+    issued: Arc<TokioMutex<VecDeque<IssuedChallenge>>>,
+}
+
+/// One challenge whose bytes the phone may still be signing.
+struct IssuedChallenge {
+    /// Exactly the bytes the phone signs: the v1 frame body or the v2
+    /// transcript encoding.
+    signed_bytes: Vec<u8>,
+    /// When it was put on the wire; older than [`ISSUED_ANSWER_TTL`] and it can
+    /// no longer be answered.
+    issued_at: Instant,
 }
 
 impl PeerEntry {
@@ -557,6 +588,7 @@ impl PeerEntry {
             nonce_cache: Arc::new(TokioMutex::new(NonceCache::new())),
             challenge_slot: Arc::new(Semaphore::new(1)),
             liveness: Arc::new(TokioMutex::new(PeerLiveness::default())),
+            issued: Arc::new(TokioMutex::new(VecDeque::new())),
         }
     }
 }
@@ -591,6 +623,7 @@ struct PeerState {
     nonce_cache: Arc<TokioMutex<NonceCache>>,
     challenge_slot: Arc<Semaphore>,
     liveness: Arc<TokioMutex<PeerLiveness>>,
+    issued: Arc<TokioMutex<VecDeque<IssuedChallenge>>>,
 }
 
 impl Orchestrator {
@@ -1244,133 +1277,176 @@ impl Orchestrator {
             self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, reason).await;
             return challenge_outcome_for_transport(&err);
         }
-        let response_bytes = match self.peripheral.wait_for_response(peer_id, deadline).await {
-            Ok(b) => b,
-            Err(PeripheralError::ResponseTimeout { .. }) => {
+        // The answer on the wire is 64 bytes with no reference to the question it
+        // answers, so the only way to recognise an answer to a *different*
+        // challenge is to try it against the challenges we issued and are no
+        // longer waiting for. Keep the recent ones for the duration of this one:
+        // W-1 cancels a challenge when the operator types a password, and the
+        // phone's late answer then arrives in the middle of the next attempt
+        // (AUDIT-001 D-28).
+        let signed_bytes = match &transcript {
+            Some(t) => t.encode(),
+            None => challenge.body_bytes().unwrap_or_default(),
+        };
+        {
+            let mut issued = peer_state.issued.lock().await;
+            let now = Instant::now();
+            issued.retain(|c| now.saturating_duration_since(c.issued_at) < ISSUED_ANSWER_TTL);
+            while issued.len() >= ISSUED_ANSWER_KEEP {
+                issued.pop_front();
+            }
+            issued.push_back(IssuedChallenge {
+                signed_bytes: signed_bytes.clone(),
+                issued_at: now,
+            });
+        }
+
+        let expiry = Instant::now() + deadline;
+        loop {
+            let remaining = expiry.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 let t_end_ms = epoch_millis(SystemTime::now());
                 self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_RESPONSE_TIMEOUT)
                     .await;
                 return ChallengeOutcome::TimedOut;
             }
-            Err(err) => {
-                let t_end_ms = epoch_millis(SystemTime::now());
-                let outcome = challenge_outcome_for_transport(&err);
-                self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, outcome.reason_str()).await;
-                return outcome;
-            }
-        };
-        // Any bytes from the phone prove it is there and answering, whatever
-        // they say — that is what keeps the deadline human-scale for a peer
-        // that is present and shortens it for one that is gone.
-        self.mark_presence(peer_id).await;
-
-        // A revocation travels on the same characteristic as a signature,
-        // because that is the only channel the phone has (AUDIT-001 D-14). It is
-        // authenticated under the bond key we are about to delete, so a stranger
-        // cannot retire somebody else's bond.
-        if deunlock_core::is_revoke_frame(&response_bytes) {
-            match deunlock_core::decode_revoke(
-                &peer_state.bond_key,
-                &response_bytes,
-                u64::try_from(epoch_millis(SystemTime::now())).unwrap_or(u64::MAX),
-            ) {
-                Ok(frame_ms) => {
-                    tracing::warn!(
-                        peer_id,
-                        frame_ms,
-                        "phone revoked its bond; dropping the desktop half"
-                    );
-                    self.drop_bond(peer_id).await;
+            let response_bytes = match self.peripheral.wait_for_response(peer_id, remaining).await {
+                Ok(b) => b,
+                Err(PeripheralError::ResponseTimeout { .. }) => {
                     let t_end_ms = epoch_millis(SystemTime::now());
-                    self.audit_at(
-                        peer_id,
-                        &nonce_hex,
-                        t_start_ms,
-                        t_end_ms,
-                        OUTCOME_REASON_BOND_REVOKED,
-                    )
-                    .await;
-                    return ChallengeOutcome::BondRevoked;
+                    self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_RESPONSE_TIMEOUT)
+                        .await;
+                    return ChallengeOutcome::TimedOut;
                 }
                 Err(err) => {
-                    // A frame that claims to be a revocation but does not
-                    // authenticate is an attack or a protocol mistake. Fall
-                    // through to signature parsing, which fails closed.
-                    tracing::warn!(peer_id, error = %err, "revocation frame rejected");
+                    let t_end_ms = epoch_millis(SystemTime::now());
+                    let outcome = challenge_outcome_for_transport(&err);
+                    self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, outcome.reason_str()).await;
+                    return outcome;
+                }
+            };
+            // Any bytes from the phone prove it is there and answering, whatever
+            // they say — that is what keeps the deadline human-scale for a peer
+            // that is present and shortens it for one that is gone.
+            self.mark_presence(peer_id).await;
+
+            // A revocation travels on the same characteristic as a signature,
+            // because that is the only channel the phone has (AUDIT-001 D-14). It
+            // is authenticated under the bond key we are about to delete, so a
+            // stranger cannot retire somebody else's bond.
+            if deunlock_core::is_revoke_frame(&response_bytes) {
+                match deunlock_core::decode_revoke(
+                    &peer_state.bond_key,
+                    &response_bytes,
+                    u64::try_from(epoch_millis(SystemTime::now())).unwrap_or(u64::MAX),
+                ) {
+                    Ok(frame_ms) => {
+                        tracing::warn!(
+                            peer_id,
+                            frame_ms,
+                            "phone revoked its bond; dropping the desktop half"
+                        );
+                        self.drop_bond(peer_id).await;
+                        let t_end_ms = epoch_millis(SystemTime::now());
+                        self.audit_at(
+                            peer_id,
+                            &nonce_hex,
+                            t_start_ms,
+                            t_end_ms,
+                            OUTCOME_REASON_BOND_REVOKED,
+                        )
+                        .await;
+                        return ChallengeOutcome::BondRevoked;
+                    }
+                    Err(err) => {
+                        // A frame that claims to be a revocation but does not
+                        // authenticate is an attack or a protocol mistake. Fall
+                        // through to signature parsing, which fails closed.
+                        tracing::warn!(peer_id, error = %err, "revocation frame rejected");
+                    }
                 }
             }
-        }
-        let signature = match parse_signature(&response_bytes) {
-            Some(s) => s,
-            None => {
+            let signature = match parse_signature(&response_bytes) {
+                Some(s) => s,
+                None => {
+                    let t_end_ms = epoch_millis(SystemTime::now());
+                    self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_BAD_SIGNATURE)
+                        .await;
+                    return ChallengeOutcome::BadSignature;
+                }
+            };
+            // An all-zero signature is the phone's Cancel wire value (see the
+            // `docs/reference/protocol.md` response table). Treat it as "the owner
+            // said no", which lets PAM fall through to the password instead of
+            // failing the whole stack — AUDIT-001 D-03.
+            if signature.to_bytes() == [0u8; SIGNATURE_LEN] {
+                let t_end_ms = epoch_millis(SystemTime::now());
+                self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_USER_DECLINED)
+                    .await;
+                return ChallengeOutcome::UserDeclined;
+            }
+            let verifying_key = match VerifyingKey::from_bytes(&peer_state.phone_pubkey) {
+                Ok(vk) => vk,
+                Err(_) => {
+                    let t_end_ms = epoch_millis(SystemTime::now());
+                    self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_BAD_SIGNATURE)
+                        .await;
+                    return ChallengeOutcome::BadSignature;
+                }
+            };
+            // v1 verified the frame body; v2 verifies the transcript, which is the
+            // same byte string the phone MAC-checked before touching a fingerprint.
+            let verified = match &transcript {
+                Some(t) => verify_transcript(&verifying_key, t, &signature),
+                None => verify_frame(&verifying_key, &challenge, &signature),
+            };
+            if verified.is_err() {
+                // Before calling this a bad signature: does it verify against a
+                // challenge we issued and are no longer waiting for? Then it is
+                // the phone answering a prompt that was withdrawn (the operator
+                // typed a password instead), not an attack — keep waiting for an
+                // answer to *this* challenge.
+                if answer_to_older_challenge(&peer_state.issued, &verifying_key, &signature, &signed_bytes).await {
+                    tracing::info!(
+                        peer_id,
+                        "ignoring an answer to a challenge that is no longer open"
+                    );
+                    continue;
+                }
+                // A bad signature is the one failure that cannot be diagnosed from
+                // counts alone: it means the desktop and the phone disagree about
+                // *what* was signed or *which key* signed it, and the two cases look
+                // identical from here. Dump the exact operands — fixed nonces are
+                // not secret, the payload is already on the wire, and without them
+                // every attempt costs a human fingerprint.
+                tracing::warn!(
+                    peer_id,
+                    signature = %hex::encode(signature.to_bytes()),
+                    pubkey = %hex::encode(peer_state.phone_pubkey),
+                    payload = %hex::encode(&signed_bytes),
+                    "bad signature: operands dumped for offline comparison"
+                );
                 let t_end_ms = epoch_millis(SystemTime::now());
                 self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_BAD_SIGNATURE)
                     .await;
                 return ChallengeOutcome::BadSignature;
             }
-        };
-        // An all-zero signature is the phone's Cancel wire value (see the
-        // `docs/reference/protocol.md` response table). Treat it as "the owner
-        // said no", which lets PAM fall through to the password instead of
-        // failing the whole stack — AUDIT-001 D-03.
-        if signature.to_bytes() == [0u8; SIGNATURE_LEN] {
-            let t_end_ms = epoch_millis(SystemTime::now());
-            self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_USER_DECLINED)
-                .await;
-            return ChallengeOutcome::UserDeclined;
-        }
-        let verifying_key = match VerifyingKey::from_bytes(&peer_state.phone_pubkey) {
-            Ok(vk) => vk,
-            Err(_) => {
+            // Post-verify replay check. SPEC §6 Idempotency: a response
+            // whose nonce was already seen for this peer is a replay.
+            let mut cache = peer_state.nonce_cache.lock().await;
+            if cache.contains(&nonce) {
                 let t_end_ms = epoch_millis(SystemTime::now());
-                self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_BAD_SIGNATURE)
+                drop(cache);
+                self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_REPLAY)
                     .await;
-                return ChallengeOutcome::BadSignature;
+                return ChallengeOutcome::Replay;
             }
-        };
-        // v1 verified the frame body; v2 verifies the transcript, which is the
-        // same byte string the phone MAC-checked before touching a fingerprint.
-        let verified = match &transcript {
-            Some(t) => verify_transcript(&verifying_key, t, &signature),
-            None => verify_frame(&verifying_key, &challenge, &signature),
-        };
-        if verified.is_err() {
-            // A bad signature is the one failure that cannot be diagnosed from
-            // counts alone: it means the desktop and the phone disagree about
-            // *what* was signed or *which key* signed it, and the two cases look
-            // identical from here. Dump the exact operands — fixed nonces are
-            // not secret, the payload is already on the wire, and without them
-            // every attempt costs a human fingerprint.
-            tracing::warn!(
-                peer_id,
-                signature = %hex::encode(signature.to_bytes()),
-                pubkey = %hex::encode(peer_state.phone_pubkey),
-                payload = %hex::encode(match &transcript {
-                    Some(t) => t.encode(),
-                    None => challenge.body_bytes().unwrap_or_default(),
-                }),
-                "bad signature: operands dumped for offline comparison"
-            );
-            let t_end_ms = epoch_millis(SystemTime::now());
-            self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_BAD_SIGNATURE)
-                .await;
-            return ChallengeOutcome::BadSignature;
-        }
-        // Post-verify replay check. SPEC §6 Idempotency: a response
-        // whose nonce was already seen for this peer is a replay.
-        let mut cache = peer_state.nonce_cache.lock().await;
-        if cache.contains(&nonce) {
-            let t_end_ms = epoch_millis(SystemTime::now());
+            cache.insert(nonce);
             drop(cache);
-            self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_REPLAY)
-                .await;
-            return ChallengeOutcome::Replay;
+            let t_end_ms = epoch_millis(SystemTime::now());
+            self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_OK).await;
+            return ChallengeOutcome::Ok { signature };
         }
-        cache.insert(nonce);
-        drop(cache);
-        let t_end_ms = epoch_millis(SystemTime::now());
-        self.audit_at(peer_id, &nonce_hex, t_start_ms, t_end_ms, OUTCOME_REASON_OK).await;
-        ChallengeOutcome::Ok { signature }
     }
 
     /// Look up the cached per-peer state needed by `issue_challenge`.
@@ -1387,6 +1463,7 @@ impl Orchestrator {
             nonce_cache: Arc::clone(&entry.nonce_cache),
             challenge_slot: Arc::clone(&entry.challenge_slot),
             liveness: Arc::clone(&entry.liveness),
+            issued: Arc::clone(&entry.issued),
         })
     }
 
@@ -1518,6 +1595,25 @@ fn parse_signature(bytes: &[u8]) -> Option<Signature> {
         return None;
     }
     Signature::from_slice(bytes).ok()
+}
+
+/// Does `signature` verify against a challenge we issued earlier, rather than
+/// the one we are waiting on?
+///
+/// This can only ever *ignore* an answer: the caller uses it to choose between
+/// "deny, this is attack-shaped" and "keep waiting, that was the previous
+/// prompt". It cannot turn anything into a success — a signature that verifies
+/// against the current challenge never reaches this function.
+async fn answer_to_older_challenge(
+    issued: &TokioMutex<VecDeque<IssuedChallenge>>,
+    verifying_key: &VerifyingKey,
+    signature: &Signature,
+    current: &[u8],
+) -> bool {
+    let queue = issued.lock().await;
+    queue.iter().any(|challenge| {
+        challenge.signed_bytes.as_slice() != current && verifying_key.verify_strict(&challenge.signed_bytes, signature).is_ok()
+    })
 }
 
 /// Build the union of `session_uuid_for(bond_key, minute)` across

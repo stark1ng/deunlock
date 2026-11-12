@@ -1028,3 +1028,50 @@ One consequence is unavoidable and belongs to the operator, not to the module:
 the screensaver collects the password itself and only hands it to the stack when
 a module asks. So the phone deadline is also how long an already-typed password
 waits. On this machine the owner chose the full 25 s budget for the lock screen.
+
+### D-28 (medium) — an answer to a withdrawn challenge poisoned the next one, CLOSED
+
+Found live, minutes after the first lock-screen unlock, in the exact sequence
+W-1 creates: type a password instead of touching the sensor, then run another
+`sudo` and touch the sensor for the prompt that is still on the phone.
+
+```
+12:24:37 INFO notify_challenge: writing frame peer_id=14f3a566… bytes=105   ← attempt 1
+12:24:38 INFO pam caller hung up mid-challenge; challenge abandoned         ← I typed a password
+12:24:40 INFO notify_challenge: writing frame peer_id=14f3a566… bytes=105   ← attempt 2
+12:24:45 WARN bad signature: operands dumped for offline comparison …       ← the answer to attempt 1
+```
+
+The phone's answer is **64 bytes and never names the question it answers**, so
+the daemon had no way to tell "the owner is answering the prompt I withdrew a
+second ago" from "somebody is forging a signature". It took the first answer on
+the wire, verified it against the challenge it was waiting on, and failed closed
+with `bad-signature`. Effect: unlock the phone, touch the sensor, get `denied` —
+and with `sufficient` the stack then falls back to the password.
+
+Fix: the daemon now keeps the last [`ISSUED_ANSWER_KEEP`] challenges it issued
+per peer (the exact bytes the phone signs, with an [`ISSUED_ANSWER_TTL`]) and,
+*when verification fails*, asks whether the signature verifies against one of
+them. If it does, that is a late answer to a challenge nobody is waiting for any
+more: log it, ignore it, keep waiting for the answer to the challenge that is
+actually open. If it verifies against nothing we issued, the verdict is still
+`bad-signature` — the ignore path cannot accept anything, because a signature
+that verifies against the current challenge never reaches it.
+
+Measured in `crates/deunlock-presenced/tests/stale_answer.rs` (3 tests):
+
+```
+# with the fix
+an_answer_to_an_abandoned_challenge_is_ignored_not_denied ... ok   → Ok
+a_late_answer_never_turns_into_a_timeout_free_success ……… ok   → TimedOut, never Ok
+a_signature_that_belongs_to_no_challenge_still_fails_closed ok   → BadSignature
+# with the stale check disabled (old behaviour), same file:
+…ignored_not_denied … FAILED  → got BadSignature
+…timeout_free_success … FAILED → got BadSignature
+…still_fails_closed … ok       (the path that must NOT relax)
+```
+
+The underlying cause — the phone showing a prompt for a challenge the desktop
+abandoned — is still D-27's open half: withdrawing it needs a desktop→phone frame
+and a phone-side handler. This fix makes the desktop honest about it in the
+meantime: a withdrawn prompt's answer is discarded instead of denying the live one.
