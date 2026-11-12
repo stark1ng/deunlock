@@ -37,6 +37,12 @@ private const val FIXTURE_CHALLENGE_LEN: Int = 33
 private const val EXPECTED_PROMPT_TEXT: String =
     "alex-desktop is requesting sudo (peer_id DD:EE:FF)"
 
+private const val SECOND_HOSTNAME: String = "other-desktop"
+private const val SECOND_PEER_ID: String = "11:22:33:44:55:66"
+private const val SECOND_CHALLENGE_SEED: Int = 7
+private const val SECOND_EXPECTED_PROMPT_TEXT: String =
+    "other-desktop is requesting sudo (peer_id 44:55:66)"
+
 private class RecordingCancelSink : CancelSink {
     val calls: MutableList<Pair<String, ByteArray>> = mutableListOf()
     override fun onCancel(peerId: String, deniedFrameBytes: ByteArray) {
@@ -50,6 +56,16 @@ private fun fixtureIntent(): Intent {
         putExtra(EXTRA_PEER_ID, FIXTURE_PEER_ID)
         putExtra(EXTRA_HOSTNAME, FIXTURE_HOSTNAME)
         putExtra(EXTRA_CHALLENGE_BYTES, ByteArray(FIXTURE_CHALLENGE_LEN) { it.toByte() })
+    }
+}
+
+/** A challenge from a different desktop, delivered to an activity that is already up. */
+private fun secondChallengeIntent(): Intent {
+    val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+    return Intent(context, ChallengeApprovalActivity::class.java).apply {
+        putExtra(EXTRA_PEER_ID, SECOND_PEER_ID)
+        putExtra(EXTRA_HOSTNAME, SECOND_HOSTNAME)
+        putExtra(EXTRA_CHALLENGE_BYTES, ByteArray(FIXTURE_CHALLENGE_LEN) { (it + SECOND_CHALLENGE_SEED).toByte() })
     }
 }
 
@@ -101,5 +117,39 @@ class ChallengeApprovalActivityTest {
         val activity = controller.get()
 
         assertEquals(EXPECTED_PROMPT_TEXT, activity.lastPromptText)
+    }
+
+    /**
+     * D-31 — a second challenge that arrives while the prompt is already up must
+     * replace it.
+     *
+     * The activity is `singleInstance` + `noHistory`: the second launch does not
+     * create an instance, it delivers `onNewIntent` to the live one. Rendering
+     * only in `onCreate` therefore left the *first* prompt on screen while the
+     * desktop was already waiting on the second challenge — the operator
+     * approved a frame nobody was waiting for, and the live challenge timed out.
+     */
+    @Test
+    fun a_second_challenge_replaces_the_prompt() {
+        val controller = Robolectric.buildActivity(
+            ChallengeApprovalActivity::class.java,
+            fixtureIntent(),
+        ).create().start().resume()
+        val activity = controller.get()
+        assertEquals(EXPECTED_PROMPT_TEXT, activity.lastPromptText)
+
+        controller.newIntent(secondChallengeIntent())
+
+        assertEquals(
+            "the live prompt must switch to the challenge that is actually open",
+            SECOND_EXPECTED_PROMPT_TEXT,
+            activity.lastPromptText,
+        )
+        assertEquals(SECOND_PEER_ID, activity.lastRenderedPeerId)
+        assertArrayEquals(
+            "the answer must be signed over the second challenge, not the first",
+            ByteArray(FIXTURE_CHALLENGE_LEN) { (it + SECOND_CHALLENGE_SEED).toByte() },
+            activity.lastRenderedChallenge,
+        )
     }
 }

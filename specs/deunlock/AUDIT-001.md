@@ -1138,3 +1138,35 @@ Installed module `e4f6c925…` (byte-identical to `target/release/libpam_deunloc
 Two `sudo` invocations, two phone approvals, no password typed. The window is
 25,000 ms (D-30), the daemon abandons a cancelled challenge (D-27) and ignores a
 late answer to one (D-28).
+
+### D-31 (medium) — the phone kept showing the first challenge, CLOSED in code
+
+`ChallengeApprovalActivity` is `launchMode="singleInstance"` + `noHistory="true"`,
+so the service's next `PendingIntent.getActivity` does not create an instance: it
+delivers `onNewIntent` to the live one. The activity had no `onNewIntent` and
+called `setContent` only from `onCreate`, so a second challenge that arrived while
+a prompt was already up was dropped — the operator approved the *first* frame
+while the desktop was waiting on the second. That is the phone half of the story
+whose desktop half is D-28: the same live sequence (`notify` … typed password …
+`notify` … `bad signature`) produces both.
+
+Measured twice on the device that the *ordinary* path is fine (two challenges
+seconds apart each produced `render` + `Displayed … ChallengeApprovalActivity`,
+task ids 8300 → 8301) — but only because the first prompt had already finished
+its dwell and called `finish()`. The live-instance path is the one that was
+broken, and it is pinned by a test rather than by a screenshot:
+`ChallengeApprovalActivityTest.a_second_challenge_replaces_the_prompt` drives
+`controller.newIntent(...)` on a resumed activity and asserts the prompt, the peer
+id and — the part that matters — the *signed challenge bytes* switch to the second
+one.
+
+```
+# with the fix
+a_second_challenge_replaces_the_prompt … ok      (139 Android unit tests, 0 failures)
+# with onNewIntent disabled (the old behaviour):
+a_second_challenge_replaces_the_prompt … FAILED  (BUILD FAILED)
+```
+
+The activity now renders from a `MutableState` and rebinds on `onNewIntent`,
+logging `re-render peer=… superseded=…`. The superseded challenge needs no
+answer: its caller has already abandoned it.

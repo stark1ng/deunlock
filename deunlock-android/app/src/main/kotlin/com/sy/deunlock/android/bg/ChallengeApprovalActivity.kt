@@ -87,6 +87,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
@@ -310,6 +311,21 @@ public class ChallengeApprovalActivity : FragmentActivity() {
     internal var lastPromptText: String = ""
         private set
 
+    /** Peer the screen is currently asking about (D-31 test seam). */
+    internal var lastRenderedPeerId: String = ""
+        private set
+
+    /** Challenge bytes the screen is currently asking about (D-31 test seam). */
+    internal var lastRenderedChallenge: ByteArray = ByteArray(0)
+        private set
+
+    /**
+     * Prompt text the Compose tree renders. A `MutableState` because the same
+     * instance can be re-bound: the activity is `singleInstance`, so a second
+     * challenge arrives through [onNewIntent], not [onCreate] (D-31).
+     */
+    private val renderedPrompt = mutableStateOf("")
+
     private var resolvedPeerId: String = ""
     private var resolvedHostname: String = ""
     private var resolvedChallenge: ByteArray = ByteArray(0)
@@ -323,22 +339,61 @@ public class ChallengeApprovalActivity : FragmentActivity() {
             lastShowWhenLockedFlag = true
             lastTurnScreenOnFlag = true
         }
+        setContent {
+            ApprovalContent(
+                promptText = renderedPrompt.value,
+                onApprove = ::onApproveClicked,
+                onCancel = ::onCancelClicked,
+            )
+        }
+        bind(intent)
+    }
+
+    /**
+     * A second challenge while this prompt is already up.
+     *
+     * `launchMode="singleInstance"` means the service's next
+     * `PendingIntent.getActivity` does **not** create an instance — it delivers
+     * here. Rendering only in `onCreate` left the first prompt on screen while
+     * the desktop was already waiting on a newer challenge, so the operator's
+     * approval answered a frame nobody was waiting for (AUDIT-001 D-31; the
+     * desktop half of the same story is D-28). Rebind to the newest challenge
+     * instead; the older one is abandoned by its caller and needs no answer.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val superseded = resolvedPeerId
+        if (!bind(intent)) {
+            return
+        }
+        Log.i(APPROVAL_LOG_TAG, "re-render peer=$resolvedPeerId superseded=$superseded")
+    }
+
+    /**
+     * Read a challenge out of [intent] and put it on screen. Returns `false`
+     * (after finishing the activity) when the intent does not carry enough to
+     * ask a question.
+     */
+    private fun bind(intent: Intent?): Boolean {
         val peerId = intent?.getStringExtra(EXTRA_PEER_ID).orEmpty()
         val hostname = intent?.getStringExtra(EXTRA_HOSTNAME).orEmpty()
         if (peerId.isEmpty() || hostname.isEmpty()) {
             Log.w(APPROVAL_LOG_TAG, "missing extras peer='$peerId' host='$hostname'; finishing")
             finish()
-            return
+            return false
         }
         resolvedPeerId = peerId
         resolvedHostname = hostname
         resolvedChallenge = intent?.getByteArrayExtra(EXTRA_CHALLENGE_BYTES) ?: ByteArray(0)
         resolvedKeystoreAlias = intent?.getStringExtra(EXTRA_KEYSTORE_ALIAS).orEmpty()
-        val short = shortPeerId(peerId)
-        val promptText = "$hostname is requesting sudo (peer_id $short)"
+        val promptText = "$hostname is requesting sudo (peer_id ${shortPeerId(peerId)})"
         lastPromptText = promptText
+        lastRenderedPeerId = peerId
+        lastRenderedChallenge = resolvedChallenge
+        renderedPrompt.value = promptText
         Log.i(APPROVAL_LOG_TAG, "render peer=$peerId host=$hostname")
-        setContent { ApprovalContent(promptText = promptText, onApprove = ::onApproveClicked, onCancel = ::onCancelClicked) }
+        return true
     }
 
     /** Test seam: invoked by the Compose Cancel button. */
