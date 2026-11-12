@@ -45,6 +45,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -202,6 +203,39 @@ class PersistentGattClientTest {
         client.start()
         shadowOf(Looper.getMainLooper()).idleFor(PersistentGattClient.RECONNECT_INTERVAL_MS, TimeUnit.MILLISECONDS)
         assertEquals(2, attempts)
+        client.stop()
+    }
+
+    @Test
+    fun a_desktop_that_never_presents_the_session_service_is_called_out() {
+        // A bond the desktop no longer has looks exactly like a working one from
+        // here, so the client used to retry forever while the UI claimed the
+        // phone was paired and a fresh pair-code had nowhere to go (D-26).
+        val handle = newShadowGatt()
+        val opener = RecordingOpener(handle)
+        val client = PersistentGattClient(
+            ctx(),
+            BluetoothAdapter.getDefaultAdapter(),
+            TEST_PEER_ID,
+            TEST_DEVICE_MAC,
+            { _, _ -> },
+            opener,
+        )
+        val marker = java.io.File(ctx().filesDir, "desktop_forgot_bond")
+        marker.delete()
+
+        client.start()
+        val callback = opener.lastCallback!!
+        repeat(PersistentGattClient.FORGOTTEN_BOND_ATTEMPTS) {
+            callback.onConnectionStateChange(handle, BluetoothGatt.GATT_SUCCESS, BluetoothProfile.STATE_CONNECTED)
+            callback.onServicesDiscovered(handle, BluetoothGatt.GATT_SUCCESS)
+        }
+
+        assertTrue("the phone must record that the desktop forgot the bond", marker.isFile)
+
+        val callsAfterGivingUp = opener.openCalls
+        shadowOf(Looper.getMainLooper()).idleFor(PersistentGattClient.RECONNECT_INTERVAL_MS * 3, TimeUnit.MILLISECONDS)
+        assertEquals("a forgotten bond must not keep burning the radio", callsAfterGivingUp, opener.openCalls)
         client.stop()
     }
 

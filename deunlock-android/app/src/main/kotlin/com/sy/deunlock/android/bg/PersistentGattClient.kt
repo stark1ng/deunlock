@@ -184,6 +184,9 @@ public class PersistentGattClient internal constructor(
      */
     private val reconnectHandler: Handler = Handler(Looper.getMainLooper())
 
+    /** Consecutive discoveries that did not carry this peer's session service. */
+    private var missingServiceAttempts: Int = 0
+
     /**
      * Bound connection setup through discovery and CCCD acknowledgement. A
      * successful ACL connection alone is not an operational unlock channel.
@@ -358,6 +361,22 @@ public class PersistentGattClient internal constructor(
                 // persisted the bond, and re-registers on every peer change. A phone
                 // that discovered services a moment too early would otherwise sit
                 // connected-and-useless forever (AUDIT-001 D-22).
+                missingServiceAttempts += 1
+                if (missingServiceAttempts >= FORGOTTEN_BOND_ATTEMPTS) {
+                    // The desktop keeps not presenting this peer's session
+                    // service. That is what a bond the other side no longer has
+                    // looks like from here, and retrying cannot fix it: say so
+                    // once, stop burning the radio, and let the UI ask for a new
+                    // pairing (AUDIT-001 D-26).
+                    Log.w(
+                        PERSISTENT_GATT_LOG_TAG,
+                        "session service absent after $missingServiceAttempts discoveries; " +
+                            "treating the bond as forgotten by the desktop",
+                    )
+                    com.sy.deunlock.android.bond.DesktopForgotMarker.mark(context.filesDir)
+                    stop()
+                    return
+                }
                 Log.w(PERSISTENT_GATT_LOG_TAG, "challenge characteristic not present; retrying discovery")
                 reconnectHandler.removeCallbacks(reconnectRunnable)
                 reconnectHandler.postDelayed(reconnectRunnable, SERVICE_SETTLE_RETRY_MS)
@@ -374,6 +393,8 @@ public class PersistentGattClient internal constructor(
             cccd.value = CCCD_ENABLE_NOTIFY
             val ok = runCatching { g.writeDescriptor(cccd) }.getOrDefault(false)
             Log.i(PERSISTENT_GATT_LOG_TAG, "subscribed: writeDescriptor=$ok")
+            missingServiceAttempts = 0
+            com.sy.deunlock.android.bond.DesktopForgotMarker.clear(context.filesDir)
         }
 
         @Deprecated("Pre-API-33 onCharacteristicChanged; we honor both forms.")
@@ -453,6 +474,14 @@ public class PersistentGattClient internal constructor(
          * without hammering the controller.
          */
         internal const val SERVICE_SETTLE_RETRY_MS: Long = 2_000L
+
+        /**
+         * Consecutive discoveries that may miss the session service before the
+         * bond is treated as forgotten by the desktop. Three covers the desktop
+         * registering the service a second or two after the phone connects,
+         * without letting a stale bond spin forever.
+         */
+        internal const val FORGOTTEN_BOND_ATTEMPTS: Int = 3
 
         /**
          * The `autoConnect` flag the production code always passes

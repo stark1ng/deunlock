@@ -824,7 +824,7 @@ and per-user paths, and restarts the unit. `scripts/install-pam-system.sh`
 (sudo) installs `pam_deunlock.so` and inserts the `sufficient` line into a PAM
 service, backing the file up first.
 
-### D-26 (medium, OPEN) — a phone cannot tell that the desktop forgot it
+### D-26 (medium) — a phone cannot tell that the desktop forgot it, CLOSED
 
 Observed live: the desktop's state was reinstalled under a new identity, so its
 `bonds.toml` was empty while the phone still held a bond record from the previous
@@ -842,11 +842,27 @@ all. Locally removing the bond record was not enough either: the *running*
 service re-persisted the in-memory bond after the file was deleted, so the app
 kept believing it was paired until the process was force-stopped first.
 
-Fix direction: after N consecutive discoveries without the session
-characteristic, mark the bond `unverified` (never delete the Keystore key), stop
-the reconnect loop, and show "this computer does not recognise this phone — pair
-again" with the pairing screen behind it. Also: a bond removal must invalidate
-the in-memory copy, not just the file.
+Fix: `PersistentGattClient` counts consecutive discoveries that do not carry the
+peer's session service. Three of them — enough to cover the desktop registering
+the service a second after the phone connects — mark the bond
+`DesktopForgotMarker` (a file in `files/`, so it survives process death), stop
+the client, and the home screen says it outright:
+
+```
+session service absent after 3 discoveries; treating the bond as forgotten by the desktop
+deunlock.bond.forgot: desktop no longer recognises this bond; pairing required
+```
+
+```
+This phone is still bonded to deunlock,
+but that computer no longer recognises it.
+Pair again with a fresh code from `deunlock pair-code`.
+```
+
+The bond record and its Keystore key are untouched: only the claim "this phone
+can unlock that computer" is withdrawn, and a completed pairing clears the marker
+(`onPairingCompleted`, and a successful subscribe in the client). Verified live on
+2026-11-12 by revoking on the desktop while the phone kept its bond.
 
 ### Product loop verified end to end (2026-11-12)
 

@@ -107,6 +107,7 @@ import com.sy.deunlock.android.history.HISTORY_DISPLAY_LIMIT
 import com.sy.deunlock.android.bond.BondRecord
 import com.sy.deunlock.android.bond.BOND_RECORD_FILE_NAME
 import com.sy.deunlock.android.bond.BondStore
+import com.sy.deunlock.android.bond.DesktopForgotMarker
 import com.sy.deunlock.android.bond.DiskBondPersister
 import com.sy.deunlock.android.bond.loadPersistedBond
 import com.sy.deunlock.android.pair.PairingScreen
@@ -288,6 +289,14 @@ class MainActivity : FragmentActivity() {
      * field is read-once).
      */
     internal val bondRecord = mutableStateOf<BondRecord?>(null)
+
+    /**
+     * True when the phone concluded the desktop no longer carries this bond
+     * (AUDIT-001 D-26). The bond stays on disk and its Keystore key is intact —
+     * only the claim "this phone can unlock that computer" is withdrawn until a
+     * fresh pairing.
+     */
+    internal val desktopForgot = mutableStateOf(false)
 
     /**
      * Runtime permission gate for the post-bond GATT client path.
@@ -543,6 +552,7 @@ class MainActivity : FragmentActivity() {
         approvePayload.value = parseApprovePayload(intent)
         val record = expireRevocationTombstone(runCatching { loadPersistedBond(filesDir) }.getOrNull())
         bondRecord.value = record
+        desktopForgot.value = record != null && DesktopForgotMarker.isMarked(filesDir)
         // Always request BLE runtime permissions on activity start, not just
         // when a bond exists. The pair flow's `BluetoothDevice.createBond()`
         // throws `SecurityException` without `BLUETOOTH_CONNECT`, and a
@@ -579,6 +589,7 @@ class MainActivity : FragmentActivity() {
                         activity = this,
                         approvePayload = approvePayload.value,
                         bondRecord = bondRecord.value,
+                        desktopForgot = desktopForgot.value,
                         cdmPairScanner = cdmPairScanner,
                         onRevoke = ::onBondRevokeTapped,
                         onPairingCompleted = ::onPairingCompleted,
@@ -589,8 +600,17 @@ class MainActivity : FragmentActivity() {
     }
 
     /** Publish the newly persisted bond before returning from the pairing screen. */
+    override fun onResume() {
+        super.onResume()
+        // The companion service draws its conclusion in the background, so the
+        // screen must re-read it rather than trust the value from onCreate.
+        desktopForgot.value = bondRecord.value != null && DesktopForgotMarker.isMarked(filesDir)
+    }
+
     internal fun onPairingCompleted() {
         val record = loadPersistedBond(filesDir) ?: return
+        DesktopForgotMarker.clear(filesDir)
+        desktopForgot.value = false
         bondRecord.value = record
         installCompanionSeams(record)
         installPersistentClientFactory(record)
@@ -683,6 +703,7 @@ private fun DeUnlockApp(
     activity: FragmentActivity,
     approvePayload: ApprovePayload?,
     bondRecord: BondRecord?,
+    desktopForgot: Boolean,
     cdmPairScanner: AndroidCdmPairCompanionScanner?,
     onRevoke: () -> Unit,
     onPairingCompleted: () -> Unit,
@@ -707,6 +728,7 @@ private fun DeUnlockApp(
             HomeRoute(
                 bondRecord = bondRecord,
                 pairedAtMillis = pairedAtMillis,
+                desktopForgot = desktopForgot,
                 onPairTapped = { navController.navigate(NavRoutes.PAIR) },
                 onRevokeTapped = onRevoke,
                 onDiagnosticTapped = { navController.navigate(NavRoutes.DIAGNOSTIC) },
@@ -918,6 +940,7 @@ private val BLUETOOTH_RUNTIME_PERMISSIONS: Array<String> = arrayOf(
 private fun HomeRoute(
     bondRecord: BondRecord?,
     pairedAtMillis: Long,
+    desktopForgot: Boolean,
     onPairTapped: () -> Unit,
     onRevokeTapped: () -> Unit,
     onDiagnosticTapped: () -> Unit,
@@ -945,8 +968,13 @@ private fun HomeRoute(
             // A tombstone is not a pairing: the operator revoked it, and the
             // only thing left is a pending message to the desktop. Showing it as
             // paired would tell the operator their phone can still unlock.
-            if (bondRecord == null || bondRecord.revokePending) {
-                UnpairedHomeBody(onPairTapped = onPairTapped)
+            if (bondRecord == null || bondRecord.revokePending || desktopForgot) {
+                UnpairedHomeBody(
+                    onPairTapped = onPairTapped,
+                    // A bond the desktop does not know looks exactly like a
+                    // working one from the phone's side, so say it outright.
+                    forgottenHostName = if (desktopForgot) bondRecord?.hostName else null,
+                )
             } else {
                 PairedHomeBody(
                     bondRecord = bondRecord,
@@ -986,8 +1014,18 @@ private fun HomeRoute(
 }
 
 @Composable
-private fun UnpairedHomeBody(onPairTapped: () -> Unit) {
-    Text(text = "Not paired with a computer yet.")
+private fun UnpairedHomeBody(
+    onPairTapped: () -> Unit,
+    forgottenHostName: String? = null,
+) {
+    if (forgottenHostName == null) {
+        Text(text = "Not paired with a computer yet.")
+    } else {
+        Text(text = "This phone is still bonded to $forgottenHostName,")
+        Text(text = "but that computer no longer recognises it.")
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(text = "Pair again with a fresh code from `deunlock pair-code`.")
+    }
     Spacer(modifier = Modifier.height(24.dp))
     Button(
         onClick = onPairTapped,
